@@ -57,7 +57,7 @@ func newBootstrapCmd() *cobra.Command {
 		// Status goes to stderr so stdout stays clean for the
 		// kubeconfig, e.g. `quick8s bootstrap host > kubeconfig.yaml`.
 		cmd.PrintErrf("Connected to %s, running preflight checks...\n", target.Host)
-		if err := k3s.Preflight(client); err != nil {
+		if err := k3s.Preflight(client, indented(cmd)); err != nil {
 			return err
 		}
 
@@ -68,12 +68,13 @@ func newBootstrapCmd() *cobra.Command {
 			}
 		}
 
-		cmd.PrintErrln("Installing K3s...")
-		if err := k3s.Install(client, k3s.InstallOpts{
-			Version:     k3sVersion,
-			ClusterInit: len(additionalControlPlanes) > 0,
-			TLSSAN:      target.Host,
-			NodeIP:      nodeIPFor(target.Host),
+		if err := slowStep(cmd, "Installing K3s...", func(progress k3s.Progress) error {
+			return k3s.Install(client, k3s.InstallOpts{
+				Version:     k3sVersion,
+				ClusterInit: len(additionalControlPlanes) > 0,
+				TLSSAN:      target.Host,
+				NodeIP:      nodeIPFor(target.Host),
+			}, progress)
 		}); err != nil {
 			return err
 		}

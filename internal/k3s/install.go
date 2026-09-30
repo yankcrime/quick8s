@@ -36,8 +36,9 @@ type InstallOpts struct {
 }
 
 // Install downloads and runs the official K3s install script on the target
-// node via the given SSH client.
-func Install(c rootRunner, opts InstallOpts) error {
+// node via the given SSH client, reporting the script's output to progress
+// as it runs.
+func Install(c rootStreamer, opts InstallOpts, progress Progress) error {
 	args := []string{"server"}
 	if opts.ClusterInit {
 		args = append(args, "--cluster-init")
@@ -49,7 +50,7 @@ func Install(c rootRunner, opts InstallOpts) error {
 		args = append(args, "--node-ip", opts.NodeIP)
 	}
 
-	if err := runInstall(c, opts.Version, nil, args); err != nil {
+	if err := runInstall(c, opts.Version, nil, args, progress); err != nil {
 		return fmt.Errorf("installing k3s: %w", err)
 	}
 	return nil
@@ -57,7 +58,12 @@ func Install(c rootRunner, opts InstallOpts) error {
 
 // runInstall keeps environment values and arguments literal. Download first
 // so a failed curl cannot be hidden by a successful empty shell invocation.
-func runInstall(c rootRunner, version string, env, args []string) error {
+//
+// The script's stdout is streamed to progress rather than buffered: it
+// narrates each phase (download, verify, install, service start), and the
+// final service start blocks until K3s reports ready, which can take a while.
+// Failures still carry the script's stderr via the returned error.
+func runInstall(c rootStreamer, version string, env, args []string, progress Progress) error {
 	script := `installer=$(curl -sfL https://get.k3s.io) && printf '%s\n' "$installer" | env`
 	if version != "" {
 		script += " " + shell.Quote("INSTALL_K3S_VERSION="+version)
@@ -69,9 +75,8 @@ func runInstall(c rootRunner, version string, env, args []string) error {
 	for _, arg := range args {
 		script += " " + shell.Quote(arg)
 	}
-	out, err := c.RunAsRoot(script)
-	if err != nil {
-		return fmt.Errorf("%w\n%s", err, out)
-	}
-	return nil
+	out := &installerOutput{progress: progress}
+	err := c.StreamAsRoot(script, out)
+	out.flush()
+	return err
 }

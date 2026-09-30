@@ -79,14 +79,24 @@ func (c *Client) Close() error {
 // Run executes cmd on the remote host and returns stdout only. On failure,
 // stderr is included in the error, preserving the underlying SSH error.
 func (c *Client) Run(cmd string) (string, error) {
-	return c.run(cmd, nil)
+	var out bytes.Buffer
+	err := c.run(cmd, nil, &out)
+	return out.String(), err
 }
 
 // RunAsRoot executes cmd directly as root, or through passwordless sudo.
 // The privilege mode is selected before execution; a failed command is never
 // retried with different privileges.
 func (c *Client) RunAsRoot(cmd string) (string, error) {
-	return c.run(rootCommand(cmd), nil)
+	var out bytes.Buffer
+	err := c.run(rootCommand(cmd), nil, &out)
+	return out.String(), err
+}
+
+// StreamAsRoot is RunAsRoot for long-running commands: stdout is written to
+// w as the remote produces it instead of being returned at the end.
+func (c *Client) StreamAsRoot(cmd string, w io.Writer) error {
+	return c.run(rootCommand(cmd), nil, w)
 }
 
 func rootCommand(cmd string) string {
@@ -95,21 +105,22 @@ func rootCommand(cmd string) string {
 		`; else exec sudo -n sh -c ` + quoted + `; fi`
 }
 
-func (c *Client) run(cmd string, stdin io.Reader) (string, error) {
+func (c *Client) run(cmd string, stdin io.Reader, stdout io.Writer) error {
 	session, err := c.conn.NewSession()
 	if err != nil {
-		return "", fmt.Errorf("opening session: %w", err)
+		return fmt.Errorf("opening session: %w", err)
 	}
 	defer session.Close()
 
 	session.Stdin = stdin
+	session.Stdout = stdout
 	var stderr bytes.Buffer
 	session.Stderr = &stderr
-	out, err := session.Output(cmd)
+	err = session.Run(cmd)
 	if err != nil && stderr.Len() > 0 {
 		err = fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
 	}
-	return string(out), err
+	return err
 }
 
 // WriteFileAsRoot uploads content as root, creating parent directories as
@@ -117,7 +128,7 @@ func (c *Client) run(cmd string, stdin io.Reader) (string, error) {
 func (c *Client) WriteFileAsRoot(remotePath string, content []byte) error {
 	dir := path.Dir(remotePath)
 	cmd := "mkdir -p " + shell.Quote(dir) + " && tee " + shell.Quote(remotePath) + " >/dev/null"
-	if _, err := c.run(rootCommand(cmd), bytes.NewReader(content)); err != nil {
+	if err := c.run(rootCommand(cmd), bytes.NewReader(content), io.Discard); err != nil {
 		return fmt.Errorf("writing %s: %w", remotePath, err)
 	}
 	return nil

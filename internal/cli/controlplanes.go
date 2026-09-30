@@ -33,7 +33,8 @@ func joinControlPlane(cmd *cobra.Command, ssh *sshFlags, host, configFile string
 	}
 	defer client.Close()
 
-	if err := k3s.Preflight(client); err != nil {
+	cmd.PrintErrf("Running preflight checks on control plane %s...\n", host)
+	if err := k3s.Preflight(client, indented(cmd)); err != nil {
 		return fmt.Errorf("control plane %s: %w", host, err)
 	}
 
@@ -44,10 +45,11 @@ func joinControlPlane(cmd *cobra.Command, ssh *sshFlags, host, configFile string
 		}
 	}
 
-	cmd.PrintErrf("Joining control plane %s...\n", host)
 	opts.TLSSAN = host
 	opts.NodeIP = nodeIPFor(host)
-	if err := k3s.JoinControlPlane(client, opts); err != nil {
+	if err := slowStep(cmd, fmt.Sprintf("Joining control plane %s...", host), func(progress k3s.Progress) error {
+		return k3s.JoinControlPlane(client, opts, progress)
+	}); err != nil {
 		return fmt.Errorf("control plane %s: %w", host, err)
 	}
 

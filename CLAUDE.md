@@ -71,6 +71,15 @@ The convention going forward:
   never `cmd.Println`.
 
 This is what makes `quick8s bootstrap host > kubeconfig.yaml` work.
+
+`internal/k3s` never prints. Operations that have something to narrate take
+a `k3s.Progress` (a `func(string)`, nil-safe), and the CLI decides where it
+goes: `indented(cmd)` for quick steps like `Preflight`, and `slowStep` for
+installs. `slowStep` indents lines under a title, prints a "still waiting"
+heartbeat after 10s of silence, and reports the elapsed time. The installer's
+stdout is streamed live via `Client.StreamAsRoot`, with the `[INFO]` prefix
+stripped. The last installer line, `systemd: Starting k3s`, blocks until K3s
+reports ready, and that is where the heartbeat matters.
 Payload writes return their errors. Cobra has `SilenceErrors` enabled so
 `main` prints each returned error once.
 

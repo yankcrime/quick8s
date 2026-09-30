@@ -269,3 +269,38 @@ func TestDialClosesAgent(t *testing.T) {
 		})
 	}
 }
+
+// signalWriter creates a file on its first write, releasing the remote side.
+type signalWriter struct {
+	path string
+	out  bytes.Buffer
+}
+
+func (w *signalWriter) Write(p []byte) (int, error) {
+	if w.out.Len() == 0 {
+		if err := os.WriteFile(w.path, nil, 0600); err != nil {
+			return 0, err
+		}
+	}
+	return w.out.Write(p)
+}
+
+func TestStreamAsRootDeliversOutputBeforeExit(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "id"), []byte("#!/bin/sh\nprintf 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c := testClient(t, []string{"PATH=" + dir + ":" + os.Getenv("PATH")})
+	// The command only finishes after the local writer has seen its first
+	// line, so a buffering implementation deadlocks until the fixture's
+	// timeout kills it.
+	w := &signalWriter{path: filepath.Join(dir, "released")}
+	err := c.StreamAsRoot("printf 'first\\n'; while [ ! -e "+filepath.Join(dir, "released")+" ]; do sleep 0.05; done; printf 'second\\n'; printf diagnostic >&2; exit 3", w)
+	var exit *ssh.ExitError
+	if !errors.As(err, &exit) || exit.ExitStatus() != 3 || !strings.Contains(err.Error(), "diagnostic") {
+		t.Fatalf("expected wrapped exit status and stderr, got %v", err)
+	}
+	if w.out.String() != "first\nsecond\n" {
+		t.Fatalf("streamed %q", w.out.String())
+	}
+}

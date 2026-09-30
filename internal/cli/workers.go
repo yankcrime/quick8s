@@ -32,13 +32,15 @@ func joinWorker(cmd *cobra.Command, ssh *sshFlags, host string, opts k3s.AgentOp
 	}
 	defer client.Close()
 
-	if err := k3s.Preflight(client); err != nil {
+	cmd.PrintErrf("Running preflight checks on worker %s...\n", host)
+	if err := k3s.Preflight(client, indented(cmd)); err != nil {
 		return fmt.Errorf("worker %s: %w", host, err)
 	}
 
-	cmd.PrintErrf("Joining worker %s...\n", host)
 	opts.NodeIP = nodeIPFor(host)
-	if err := k3s.JoinAgent(client, opts); err != nil {
+	if err := slowStep(cmd, fmt.Sprintf("Joining worker %s...", host), func(progress k3s.Progress) error {
+		return k3s.JoinAgent(client, opts, progress)
+	}); err != nil {
 		return fmt.Errorf("worker %s: %w", host, err)
 	}
 
