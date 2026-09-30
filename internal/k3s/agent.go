@@ -2,8 +2,6 @@ package k3s
 
 import (
 	"fmt"
-
-	"quick8s/internal/node"
 )
 
 // AgentOpts controls how the K3s agent install script is invoked on a
@@ -23,19 +21,15 @@ type AgentOpts struct {
 
 // JoinAgent installs K3s in agent mode on the target node, joining it to the
 // cluster at ServerURL as a worker.
-func JoinAgent(c *node.Client, opts AgentOpts) error {
-	script := fmt.Sprintf("curl -sfL https://get.k3s.io | K3S_URL=%q K3S_TOKEN=%q", opts.ServerURL, opts.Token)
-	if opts.Version != "" {
-		script += fmt.Sprintf(" INSTALL_K3S_VERSION=%q", opts.Version)
-	}
-	script += " sh -s -"
+func JoinAgent(c rootRunner, opts AgentOpts) error {
+	env := []string{"K3S_URL=" + opts.ServerURL, "K3S_TOKEN=" + opts.Token}
+	args := []string{"agent"}
 	if opts.NodeIP != "" {
-		script += fmt.Sprintf(" --node-ip %q", opts.NodeIP)
+		args = append(args, "--node-ip", opts.NodeIP)
 	}
 
-	out, err := c.Run(script)
-	if err != nil {
-		return fmt.Errorf("joining worker: %w\n%s", err, out)
+	if err := runInstall(c, opts.Version, env, args); err != nil {
+		return fmt.Errorf("joining worker: %w", err)
 	}
 	return nil
 }

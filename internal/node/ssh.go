@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path"
@@ -14,19 +15,29 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/term"
+
+	"quick8s/internal/shell"
 )
 
 // Client is an SSH connection to a Target, used to run remote commands
 // during bootstrap.
 type Client struct {
-	target Target
-	conn   *ssh.Client
+	conn *ssh.Client
 }
 
 // Dial connects to the given target over SSH, authenticating via the
 // running SSH agent by default, or an explicit private key if KeyPath is set.
 func Dial(t Target) (*Client, error) {
-	methods, agentAvailable, err := authMethods(t.KeyPath)
+	// The agent is only needed during authentication. Dial owns its socket,
+	// including cleanup when key parsing or the SSH handshake fails.
+	var agentConn net.Conn
+	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+		agentConn, _ = net.Dial("unix", sock)
+		if agentConn != nil {
+			defer agentConn.Close()
+		}
+	}
+	methods, err := authMethods(t.KeyPath, agentConn)
 	if err != nil {
 		return nil, err
 	}
@@ -45,12 +56,12 @@ func Dial(t Target) (*Client, error) {
 	if err != nil {
 		if strings.Contains(err.Error(), "unable to authenticate") {
 			return nil, fmt.Errorf("dialing %s: %w\nhint: no offered key was accepted for %s@%s; run `ssh-add <key>` to load the right key into your agent (check what's loaded with `ssh-add -l`), or pass --ssh-key explicitly%s",
-				addr, err, t.User, t.Host, agentHint(agentAvailable))
+				addr, err, t.User, t.Host, agentHint(agentConn != nil))
 		}
 		return nil, fmt.Errorf("dialing %s: %w", addr, err)
 	}
 
-	return &Client{target: t, conn: conn}, nil
+	return &Client{conn: conn}, nil
 }
 
 func agentHint(agentAvailable bool) string {
@@ -65,39 +76,49 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-// Run executes cmd on the remote host in its own session and returns
-// combined stdout+stderr.
+// Run executes cmd on the remote host and returns stdout only. On failure,
+// stderr is included in the error, preserving the underlying SSH error.
 func (c *Client) Run(cmd string) (string, error) {
+	return c.run(cmd, nil)
+}
+
+// RunAsRoot executes cmd directly as root, or through passwordless sudo.
+// The privilege mode is selected before execution; a failed command is never
+// retried with different privileges.
+func (c *Client) RunAsRoot(cmd string) (string, error) {
+	return c.run(rootCommand(cmd), nil)
+}
+
+func rootCommand(cmd string) string {
+	quoted := shell.Quote(cmd)
+	return `uid=$(id -u) || exit; if [ "$uid" = 0 ]; then exec sh -c ` + quoted +
+		`; else exec sudo -n sh -c ` + quoted + `; fi`
+}
+
+func (c *Client) run(cmd string, stdin io.Reader) (string, error) {
 	session, err := c.conn.NewSession()
 	if err != nil {
 		return "", fmt.Errorf("opening session: %w", err)
 	}
 	defer session.Close()
 
-	out, err := session.CombinedOutput(cmd)
+	session.Stdin = stdin
+	var stderr bytes.Buffer
+	session.Stderr = &stderr
+	out, err := session.Output(cmd)
+	if err != nil && stderr.Len() > 0 {
+		err = fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+	}
 	return string(out), err
 }
 
-// WriteFile uploads content to path on the remote host as root, creating
-// parent directories as needed. Requires the SSH user to be root or have
-// passwordless sudo (see Preflight).
-func (c *Client) WriteFile(remotePath string, content []byte) error {
-	session, err := c.conn.NewSession()
-	if err != nil {
-		return fmt.Errorf("opening session: %w", err)
-	}
-	defer session.Close()
-
-	session.Stdin = bytes.NewReader(content)
-
-	var out bytes.Buffer
-	session.Stdout = &out
-	session.Stderr = &out
-
+// WriteFileAsRoot uploads content as root, creating parent directories as
+// needed. It uses the same privilege selection as RunAsRoot.
+func (c *Client) WriteFileAsRoot(remotePath string, content []byte) error {
 	dir := path.Dir(remotePath)
-	cmd := fmt.Sprintf("sudo -n mkdir -p %q && sudo -n tee %q >/dev/null", dir, remotePath)
-	if err := session.Run(cmd); err != nil {
-		return fmt.Errorf("writing %s: %w\n%s", remotePath, err, out.String())
+	cmd := "mkdir -p " + shell.Quote(dir) + " && tee " + shell.Quote(remotePath) + " >/dev/null"
+	if _, err := c.run(rootCommand(cmd), bytes.NewReader(content)); err != nil {
+		return fmt.Errorf("writing %s: %w", remotePath, err)
 	}
 	return nil
 }
@@ -105,27 +126,25 @@ func (c *Client) WriteFile(remotePath string, content []byte) error {
 // authMethods builds the list of SSH auth methods to offer, preferring the
 // running SSH agent (so users don't need to point at a key file at all) and
 // adding an explicit private key on top when one is given.
-func authMethods(keyPath string) (methods []ssh.AuthMethod, agentAvailable bool, err error) {
-	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
-		if conn, dialErr := net.Dial("unix", sock); dialErr == nil {
-			agentAvailable = true
-			methods = append(methods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
-		}
+func authMethods(keyPath string, agentConn net.Conn) ([]ssh.AuthMethod, error) {
+	var methods []ssh.AuthMethod
+	if agentConn != nil {
+		methods = append(methods, ssh.PublicKeysCallback(agent.NewClient(agentConn).Signers))
 	}
 
 	if keyPath != "" {
 		signer, err := loadPrivateKey(keyPath)
 		if err != nil {
-			return nil, agentAvailable, err
+			return nil, err
 		}
 		methods = append(methods, ssh.PublicKeys(signer))
 	}
 
 	if len(methods) == 0 {
-		return nil, agentAvailable, fmt.Errorf("no SSH auth methods available: no running SSH agent found and no --ssh-key provided; run `ssh-add <key>` to load a key into your agent")
+		return nil, errors.New("no SSH auth methods available: no running SSH agent found and no --ssh-key provided; run `ssh-add <key>` to load a key into your agent")
 	}
 
-	return methods, agentAvailable, nil
+	return methods, nil
 }
 
 // loadPrivateKey reads and parses a private key file, prompting for a

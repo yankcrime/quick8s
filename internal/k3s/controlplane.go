@@ -2,8 +2,6 @@ package k3s
 
 import (
 	"fmt"
-
-	"quick8s/internal/node"
 )
 
 // ControlPlaneOpts controls how an additional control plane node joins an
@@ -16,10 +14,10 @@ type ControlPlaneOpts struct {
 	ServerURL string
 	// Token is the cluster join token, from NodeToken.
 	Token string
-	// TLSSan is added as a certificate SAN for this node's own server cert
+	// TLSSAN is added as a certificate SAN for this node's own server cert
 	// (each control plane node runs its own apiserver). Should be the host
-	// used to dial this specific node - see InstallOpts.TLSSan.
-	TLSSan string
+	// used to dial this specific node - see InstallOpts.TLSSAN.
+	TLSSAN string
 	// NodeIP pins this node's own advertised address - see InstallOpts.NodeIP.
 	NodeIP string
 }
@@ -28,22 +26,18 @@ type ControlPlaneOpts struct {
 // it to the cluster at ServerURL as an additional control plane / etcd
 // member. The initiating control plane must have been installed with
 // InstallOpts.ClusterInit for this to work.
-func JoinControlPlane(c *node.Client, opts ControlPlaneOpts) error {
-	script := fmt.Sprintf("curl -sfL https://get.k3s.io | K3S_TOKEN=%q", opts.Token)
-	if opts.Version != "" {
-		script += fmt.Sprintf(" INSTALL_K3S_VERSION=%q", opts.Version)
-	}
-	script += fmt.Sprintf(" sh -s - server --server %q", opts.ServerURL)
-	if opts.TLSSan != "" {
-		script += fmt.Sprintf(" --tls-san %q", opts.TLSSan)
+func JoinControlPlane(c rootRunner, opts ControlPlaneOpts) error {
+	env := []string{"K3S_TOKEN=" + opts.Token}
+	args := []string{"server", "--server", opts.ServerURL}
+	if opts.TLSSAN != "" {
+		args = append(args, "--tls-san", opts.TLSSAN)
 	}
 	if opts.NodeIP != "" {
-		script += fmt.Sprintf(" --node-ip %q", opts.NodeIP)
+		args = append(args, "--node-ip", opts.NodeIP)
 	}
 
-	out, err := c.Run(script)
-	if err != nil {
-		return fmt.Errorf("joining control plane: %w\n%s", err, out)
+	if err := runInstall(c, opts.Version, env, args); err != nil {
+		return fmt.Errorf("joining control plane: %w", err)
 	}
 	return nil
 }

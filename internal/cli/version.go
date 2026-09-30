@@ -14,8 +14,8 @@ func newVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print the quick8s version",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println(Version)
-			return nil
+			_, err := fmt.Fprintln(cmd.OutOrStdout(), Version)
+			return err
 		},
 	}
 }

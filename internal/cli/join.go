@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"net"
 
 	"github.com/spf13/cobra"
 
@@ -44,7 +45,11 @@ func newJoinCmd() *cobra.Command {
 			return err
 		}
 
-		return joinWorkers(cmd, ssh, serverHost, token, k3sVersion, workers)
+		return joinWorkers(cmd, ssh, workers, k3s.AgentOpts{
+			Version:   k3sVersion,
+			ServerURL: "https://" + net.JoinHostPort(serverHost, "6443"),
+			Token:     token,
+		})
 	}
 
 	return cmd

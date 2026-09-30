@@ -9,14 +9,12 @@ import (
 	"quick8s/internal/node"
 )
 
-// joinWorkers joins each host in workers to the cluster at serverHost as a
+// joinWorkers joins each host in workers to the cluster at opts.ServerURL as a
 // K3s agent, using a node token already fetched from the control plane.
 // Shared between `bootstrap --worker` and the standalone `join` command.
-func joinWorkers(cmd *cobra.Command, ssh *sshFlags, serverHost, token, k3sVersion string, workers []string) error {
-	serverURL := fmt.Sprintf("https://%s:6443", serverHost)
-
+func joinWorkers(cmd *cobra.Command, ssh *sshFlags, workers []string, opts k3s.AgentOpts) error {
 	for _, host := range workers {
-		if err := joinWorker(cmd, ssh, host, serverURL, token, k3sVersion); err != nil {
+		if err := joinWorker(cmd, ssh, host, opts); err != nil {
 			return err
 		}
 	}
@@ -24,7 +22,7 @@ func joinWorkers(cmd *cobra.Command, ssh *sshFlags, serverHost, token, k3sVersio
 	return nil
 }
 
-func joinWorker(cmd *cobra.Command, ssh *sshFlags, host, serverURL, token, k3sVersion string) error {
+func joinWorker(cmd *cobra.Command, ssh *sshFlags, host string, opts k3s.AgentOpts) error {
 	target := ssh.target(host)
 
 	cmd.PrintErrf("Connecting to worker %s...\n", host)
@@ -39,7 +37,8 @@ func joinWorker(cmd *cobra.Command, ssh *sshFlags, host, serverURL, token, k3sVe
 	}
 
 	cmd.PrintErrf("Joining worker %s...\n", host)
-	if err := k3s.JoinAgent(client, k3s.AgentOpts{Version: k3sVersion, ServerURL: serverURL, Token: token, NodeIP: nodeIPFor(host)}); err != nil {
+	opts.NodeIP = nodeIPFor(host)
+	if err := k3s.JoinAgent(client, opts); err != nil {
 		return fmt.Errorf("worker %s: %w", host, err)
 	}
 

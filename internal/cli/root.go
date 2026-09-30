@@ -9,8 +9,9 @@ import (
 // NewRootCmd builds the top-level quick8s command tree.
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "quick8s",
-		Short: "Bootstrap K3s Kubernetes clusters over SSH",
+		Use:           "quick8s",
+		Short:         "Bootstrap K3s Kubernetes clusters over SSH",
+		SilenceErrors: true, // main owns error reporting.
 	}
 
 	root.AddCommand(newBootstrapCmd())

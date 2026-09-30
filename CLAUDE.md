@@ -10,8 +10,8 @@ making structural changes.
 cmd/quick8s        entrypoint only, wires up the Cobra root command
 internal/cli        Cobra command definitions — flag parsing + orchestration only
 internal/node        Target (host/port/user/key) + Client (SSH connection wrapper)
-internal/k3s         K3s-specific operations, each taking a *node.Client
-internal/config      resolved run options struct (currently unused by the CLI; placeholder for a future config-file-driven mode)
+internal/k3s         K3s-specific operations taking narrow, consumer-defined remote interfaces
+internal/shell       literal POSIX shell argument quoting shared by node and k3s
 hack/                dev/test scripts (currently just the e2e harness)
 ```
 
@@ -40,24 +40,21 @@ print status to stderr / payload to stdout. Business logic belongs in
 
 ## Root-owned remote files
 
-Several operations need to read/write files owned by root
-(`/etc/rancher/k3s/config.yaml`, `k3s.yaml`, the node-token) from an SSH user
-that may or may not be root. The established pattern, used consistently
-across `kubeconfig.go`, `token.go`, `configfile.go`, `uninstall.go`:
+`Client.RunAsRoot` and `Client.WriteFileAsRoot` select privileges before
+executing a command: run directly when the remote UID is zero, otherwise
+use `sudo -n sh -c`. Never retry a failed operation under different
+privileges. This works for root on minimal images without sudo, preserves
+stdin for uploads, and avoids executing a failed uninstall twice.
 
-```
-sudo -n cat <path> 2>/dev/null || cat <path>
-```
+`Run` and `RunAsRoot` return stdout only; stderr is attached to failures
+without losing the underlying SSH error. This keeps diagnostics out of
+kubeconfig and token payloads. `Preflight` checks root access through this
+same capability and treats SSH failures separately from an absent binary.
 
-Try passwordless sudo first, fall back to a plain read (covers the case where
-the SSH user already *is* root and sudo isn't even installed). `Preflight`
-enforces up front that the user is root or has passwordless sudo, so this
-fallback should always succeed for install-time operations.
-
-`Client.WriteFile` follows the same idea for writes (`sudo mkdir -p && sudo
-tee`) — note it does **not** use the try/fallback pattern, because stdin can
-only be consumed once; it just assumes sudo works, which Preflight already
-guarantees.
+Use `internal/shell.Quote` for literal shell arguments, not Go's `%q`.
+K3s install operations share a private installer helper for quoting and
+invocation. The SSH agent socket is owned by `Dial` and closes when the
+handshake completes or any earlier step fails.
 
 ## stdout vs stderr — a cobra footgun to remember
 
@@ -74,6 +71,8 @@ The convention going forward:
   never `cmd.Println`.
 
 This is what makes `quick8s bootstrap host > kubeconfig.yaml` work.
+Payload writes return their errors. Cobra has `SilenceErrors` enabled so
+`main` prints each returned error once.
 
 ## Design philosophy: don't grow the flag surface to mirror K3s
 

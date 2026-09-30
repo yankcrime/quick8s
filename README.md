@@ -129,6 +129,11 @@ go run ./cmd/quick8s teardown <host-or-ip>       # uninstall K3s (prompts for co
 
 ## Testing
 
+`go test ./...` runs local tests for shell quoting, installer arguments,
+privilege selection, SSH output and authentication cleanup, and CLI output.
+The SSH tests use a local server and simulated sudo; they do not install K3s
+or require root. Run `go vet ./...` for static checks.
+
 `hack/e2e-test.sh` (macOS only) runs the full lifecycle — bootstrap,
 kubeconfig, teardown — against a real, disposable VM. It uses
 [colima](https://github.com/abiosoft/colima) with `--network-address
@@ -157,9 +162,9 @@ directly (respects `COLIMA_PROFILE` the same way).
 
 - `cmd/quick8s` — entrypoint, wires up the Cobra root command
 - `internal/cli` — Cobra command definitions (flag parsing only)
-- `internal/config` — resolved run options, shared between flags and (future) config files
 - `internal/node` — target node model and SSH client
 - `internal/k3s` — K3s install orchestration and preflight checks
+- `internal/shell` — literal POSIX shell argument quoting shared by SSH and K3s
 - `hack/` — dev/test scripts (e2e harness)
 
 ## License

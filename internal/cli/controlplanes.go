@@ -10,14 +10,12 @@ import (
 )
 
 // joinControlPlanes joins each host in controlPlanes to the cluster at
-// serverHost as an additional K3s server node, forming an HA embedded-etcd
-// cluster together with serverHost. serverHost must already have been
+// opts.ServerURL as an additional K3s server node, forming an HA embedded-etcd
+// cluster. The initiating server must already have been
 // installed with ClusterInit for this to work.
-func joinControlPlanes(cmd *cobra.Command, ssh *sshFlags, serverHost, token, k3sVersion, configFile string, controlPlanes []string) error {
-	serverURL := fmt.Sprintf("https://%s:6443", serverHost)
-
+func joinControlPlanes(cmd *cobra.Command, ssh *sshFlags, controlPlanes []string, configFile string, opts k3s.ControlPlaneOpts) error {
 	for _, host := range controlPlanes {
-		if err := joinControlPlane(cmd, ssh, host, serverURL, token, k3sVersion, configFile); err != nil {
+		if err := joinControlPlane(cmd, ssh, host, configFile, opts); err != nil {
 			return err
 		}
 	}
@@ -25,7 +23,7 @@ func joinControlPlanes(cmd *cobra.Command, ssh *sshFlags, serverHost, token, k3s
 	return nil
 }
 
-func joinControlPlane(cmd *cobra.Command, ssh *sshFlags, host, serverURL, token, k3sVersion, configFile string) error {
+func joinControlPlane(cmd *cobra.Command, ssh *sshFlags, host, configFile string, opts k3s.ControlPlaneOpts) error {
 	target := ssh.target(host)
 
 	cmd.PrintErrf("Connecting to control plane %s...\n", host)
@@ -47,7 +45,9 @@ func joinControlPlane(cmd *cobra.Command, ssh *sshFlags, host, serverURL, token,
 	}
 
 	cmd.PrintErrf("Joining control plane %s...\n", host)
-	if err := k3s.JoinControlPlane(client, k3s.ControlPlaneOpts{Version: k3sVersion, ServerURL: serverURL, Token: token, TLSSan: host, NodeIP: nodeIPFor(host)}); err != nil {
+	opts.TLSSAN = host
+	opts.NodeIP = nodeIPFor(host)
+	if err := k3s.JoinControlPlane(client, opts); err != nil {
 		return fmt.Errorf("control plane %s: %w", host, err)
 	}
 

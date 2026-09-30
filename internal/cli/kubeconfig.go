@@ -32,9 +32,8 @@ func newKubeconfigCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(cmd.OutOrStdout(), kubeconfig)
-
-		return nil
+		_, err = fmt.Fprintln(cmd.OutOrStdout(), kubeconfig)
+		return err
 	}
 
 	return cmd
