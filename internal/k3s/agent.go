@@ -21,14 +21,14 @@ type AgentOpts struct {
 
 // JoinAgent installs K3s in agent mode on the target node, joining it to the
 // cluster at ServerURL as a worker.
-func JoinAgent(c rootRunner, opts AgentOpts) error {
+func JoinAgent(c rootStreamer, opts AgentOpts, progress Progress) error {
 	env := []string{"K3S_URL=" + opts.ServerURL, "K3S_TOKEN=" + opts.Token}
 	args := []string{"agent"}
 	if opts.NodeIP != "" {
 		args = append(args, "--node-ip", opts.NodeIP)
 	}
 
-	if err := runInstall(c, opts.Version, env, args); err != nil {
+	if err := runInstall(c, opts.Version, env, args, progress); err != nil {
 		return fmt.Errorf("joining worker: %w", err)
 	}
 	return nil

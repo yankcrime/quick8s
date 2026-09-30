@@ -26,7 +26,7 @@ type ControlPlaneOpts struct {
 // it to the cluster at ServerURL as an additional control plane / etcd
 // member. The initiating control plane must have been installed with
 // InstallOpts.ClusterInit for this to work.
-func JoinControlPlane(c rootRunner, opts ControlPlaneOpts) error {
+func JoinControlPlane(c rootStreamer, opts ControlPlaneOpts, progress Progress) error {
 	env := []string{"K3S_TOKEN=" + opts.Token}
 	args := []string{"server", "--server", opts.ServerURL}
 	if opts.TLSSAN != "" {
@@ -36,7 +36,7 @@ func JoinControlPlane(c rootRunner, opts ControlPlaneOpts) error {
 		args = append(args, "--node-ip", opts.NodeIP)
 	}
 
-	if err := runInstall(c, opts.Version, env, args); err != nil {
+	if err := runInstall(c, opts.Version, env, args, progress); err != nil {
 		return fmt.Errorf("joining control plane: %w", err)
 	}
 	return nil

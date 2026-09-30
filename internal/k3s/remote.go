@@ -1,5 +1,7 @@
 package k3s
 
+import "io"
+
 // These interfaces describe only the remote capabilities each operation uses.
 // node.Client implements them; tests can supply an in-memory implementation.
 type runner interface {
@@ -17,4 +19,8 @@ type preflightRunner interface {
 
 type rootFileWriter interface {
 	WriteFileAsRoot(string, []byte) error
+}
+
+type rootStreamer interface {
+	StreamAsRoot(string, io.Writer) error
 }
