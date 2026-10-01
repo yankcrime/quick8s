@@ -148,39 +148,63 @@ func TestPreflight(t *testing.T) {
 	}
 }
 
-func TestUninstallFailures(t *testing.T) {
+func TestUninstall(t *testing.T) {
 	failure := errors.New("connection lost")
 	for _, tt := range []struct {
-		name       string
-		probe      string
-		probeErr   error
-		installErr error
-		wantCalls  int
+		name        string
+		probe       string
+		probeErr    error
+		installErr  error
+		wantScript  string
+		wantErr     bool
+		wantMissing bool
 	}{
-		{name: "missing", wantCalls: 1},
-		{name: "probe failure", probeErr: failure, wantCalls: 1},
-		{name: "uninstall failure", probe: "installed", installErr: failure, wantCalls: 2},
+		{name: "server", probe: "server\n", wantScript: uninstallScriptPath},
+		{name: "agent", probe: "agent\n", wantScript: agentUninstallScriptPath},
+		{name: "missing", wantErr: true, wantMissing: true},
+		{name: "probe failure", probeErr: failure, wantErr: true},
+		{name: "uninstall failure", probe: "server\n", installErr: failure, wantScript: uninstallScriptPath, wantErr: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			calls := 0
-			c := remoteStub{runRoot: func(string) (string, error) {
-				calls++
-				if calls == 1 {
-					return tt.probe, tt.probeErr
-				}
-				return "", tt.installErr
-			}}
+			var ran []string
+			c := remoteStub{
+				run: func(string) (string, error) { return tt.probe, tt.probeErr },
+				runRoot: func(cmd string) (string, error) {
+					ran = append(ran, cmd)
+					return "", tt.installErr
+				},
+			}
 			err := Uninstall(c)
-			if err == nil || calls != tt.wantCalls {
-				t.Fatalf("calls = %d, error = %v", calls, err)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.wantScript == "" && len(ran) != 0 || tt.wantScript != "" && !reflect.DeepEqual(ran, []string{tt.wantScript}) {
+				t.Fatalf("ran %q, want %q", ran, tt.wantScript)
 			}
 			if (tt.probeErr != nil || tt.installErr != nil) && !errors.Is(err, failure) {
 				t.Fatalf("lost underlying error: %v", err)
 			}
-			if tt.probeErr != nil && strings.Contains(err.Error(), "does not appear") {
-				t.Fatalf("transport error reported as missing install: %v", err)
+			if errors.Is(err, ErrNotInstalled) != tt.wantMissing {
+				t.Fatalf("transport error and missing install confused: %v", err)
 			}
 		})
+	}
+}
+
+func TestVersion(t *testing.T) {
+	for _, tt := range []struct {
+		out, want string
+		wantErr   bool
+	}{
+		{out: "k3s version v1.30.4+k3s1 (98262b5d)\ngo version go1.22.5\n", want: "v1.30.4+k3s1"},
+		{out: "sh: /usr/local/bin/k3s: not found\n", wantErr: true},
+		{out: "", wantErr: true},
+	} {
+		c := remoteStub{run: func(string) (string, error) { return tt.out, nil }}
+		got, err := Version(c)
+		if got != tt.want || (err != nil) != tt.wantErr {
+			t.Fatalf("Version(%q) = %q, %v", tt.out, got, err)
+		}
 	}
 }
 

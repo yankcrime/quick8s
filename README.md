@@ -6,7 +6,71 @@ A CLI that simplifies bootstrapping a Kubernetes cluster with [K3s](https://k3s.
 
 Early scaffold. Current scope: bootstrapping a K3s control plane on a remote
 host identified by hostname or IP, optionally forming an HA (multi-node)
-control plane and/or joining worker nodes to it.
+control plane and/or joining worker nodes to it — either imperatively with
+`bootstrap`, or declaratively from a `quick8s.yaml` with `up`/`down`.
+
+## Declarative clusters: `quick8s.yaml`, `up` and `down`
+
+Describe the cluster in a `quick8s.yaml` and manage it Terraform-style from
+the directory holding it:
+
+```yaml
+cluster:
+  kubernetesVersion: v1.33.4+k3s1   # K3s release; omit for latest stable
+
+  ssh:                              # optional; same defaults as the --ssh-* flags
+    user: ubuntu
+    # key: ~/.ssh/id_ed25519        # relative paths are relative to this file
+
+  nodes:                            # hostnames or IPs
+    controlPlane:                   # the first one initializes the cluster
+      - 192.168.1.10
+      - 192.168.1.11
+      - 192.168.1.12
+    worker:
+      - 192.168.1.20
+
+k3s:                                # K3s's own config.yaml, passed through as-is
+  server:                           # -> /etc/rancher/k3s/config.yaml on control planes
+    disable: [traefik]
+  agent:                            # -> /etc/rancher/k3s/config.yaml on workers
+    node-label: [tier=general]
+```
+
+```
+quick8s up > kubeconfig.yaml      # create the cluster, or add new nodes to it
+quick8s down                      # destroy it (prompts; -y to skip)
+```
+
+Both take `-f/--file` to point at a definition elsewhere. See
+[`examples/quick8s.yaml`](examples/quick8s.yaml) for a commented example.
+
+**`up`** connects to every node and checks what's installed before changing
+anything, so an unreachable node or a node running K3s in the wrong role
+fails with nothing touched. Nodes already running K3s in their listed role
+are left alone; the rest are installed — the first control plane
+initializes the cluster (with embedded etcd when there's more than one
+control plane), and the others join it. So `up` is safe to re-run, and
+adding a node to the file and running `up` again joins just that node.
+There's no state file: the nodes themselves are the state.
+
+What `up` deliberately doesn't do (yet):
+
+- **Remove nodes** dropped from the file — there's no record of them. Use
+  `teardown <host>` on the node.
+- **Upgrade or reconfigure** existing nodes when `kubernetesVersion` or the
+  `k3s` sections change. New nodes always install the version the cluster
+  is already running (so they can't end up newer than the control plane),
+  and `up` warns if that differs from `kubernetesVersion`.
+- **Grow a single-server cluster into HA.** A cluster created with one
+  control plane uses sqlite, which other servers can't join; `up` refuses
+  with an explanation. If you expect to add control planes later, set
+  `cluster-init: true` under `k3s.server` when first creating it.
+
+**`down`** uninstalls K3s from every node in the file, workers first and the
+initializing control plane last. Nodes without K3s are skipped, and one
+failed node doesn't stop the rest, so an interrupted `down` can simply be
+re-run.
 
 ## Usage
 
@@ -124,7 +188,7 @@ Other commands:
 
 ```
 go run ./cmd/quick8s kubeconfig <host-or-ip>     # fetch just the kubeconfig, printed to stdout
-go run ./cmd/quick8s teardown <host-or-ip>       # uninstall K3s (prompts for confirmation; -y to skip)
+go run ./cmd/quick8s teardown <host-or-ip>       # uninstall K3s, server or worker (prompts for confirmation; -y to skip)
 ```
 
 ## Testing
@@ -135,7 +199,7 @@ The SSH tests use a local server and simulated sudo; they do not install K3s
 or require root. Run `go vet ./...` for static checks.
 
 `hack/e2e-test.sh` (macOS only) runs the full lifecycle — bootstrap,
-kubeconfig, teardown — against a real, disposable VM. It uses
+kubeconfig, teardown, then up, up again (a no-op), down — against a real, disposable VM. It uses
 [colima](https://github.com/abiosoft/colima) with `--network-address
 --network-mode bridged` to give the VM a real LAN IP via DHCP, so the test
 goes over an actual network hop rather than a forwarded loopback port, same
@@ -162,6 +226,7 @@ directly (respects `COLIMA_PROFILE` the same way).
 
 - `cmd/quick8s` — entrypoint, wires up the Cobra root command
 - `internal/cli` — Cobra command definitions (flag parsing only)
+- `internal/cluster` — `quick8s.yaml` loading, validation, and `up`'s plan
 - `internal/node` — target node model and SSH client
 - `internal/k3s` — K3s install orchestration and preflight checks
 - `internal/shell` — literal POSIX shell argument quoting shared by SSH and K3s

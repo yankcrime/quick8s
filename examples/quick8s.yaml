@@ -1,0 +1,39 @@
+# A quick8s cluster definition. Run `quick8s up` in the directory holding
+# this file to create the cluster, and `quick8s down` to destroy it.
+cluster:
+  # K3s release to install (https://github.com/k3s-io/k3s/releases). Omit for
+  # the latest stable release at the time the cluster is created.
+  kubernetesVersion: v1.33.4+k3s1
+
+  # Optional. Authentication always tries the running SSH agent first; key is
+  # an extra fallback. user defaults to your local username, port to 22.
+  ssh:
+    user: ubuntu
+    # key: ~/.ssh/id_ed25519
+
+  # Nodes, by hostname or IP.
+  nodes:
+    # K3s server nodes. The first one initializes the cluster; with more than
+    # one, they form an HA control plane on embedded etcd - use an odd number.
+    controlPlane:
+      - 192.168.1.10
+      - 192.168.1.11
+      - 192.168.1.12
+    worker:
+      - 192.168.1.20
+      - 192.168.1.21
+
+# K3s's own configuration (https://docs.k3s.io/installation/configuration#configuration-file),
+# written to /etc/rancher/k3s/config.yaml before K3s first starts. Keys are
+# K3s CLI flags without the leading dashes.
+k3s:
+  # For control plane (server) nodes.
+  server:
+    disable:
+      - traefik
+    tls-san:
+      - k8s.example.com
+  # For worker (agent) nodes.
+  agent:
+    node-label:
+      - tier=general

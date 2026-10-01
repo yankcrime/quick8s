@@ -45,7 +45,7 @@ func newJoinCmd() *cobra.Command {
 			return err
 		}
 
-		return joinWorkers(cmd, ssh, workers, k3s.AgentOpts{
+		return joinWorkers(cmd, ssh, workers, nil, k3s.AgentOpts{
 			Version:   k3sVersion,
 			ServerURL: "https://" + net.JoinHostPort(serverHost, "6443"),
 			Token:     token,
