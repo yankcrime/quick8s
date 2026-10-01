@@ -1,24 +1,34 @@
 package k3s
 
 import (
+	"errors"
 	"fmt"
-	"strings"
 )
 
-const uninstallScriptPath = "/usr/local/bin/k3s-uninstall.sh"
+// ErrNotInstalled is returned by Uninstall when the node has no K3s
+// installation to remove.
+var ErrNotInstalled = errors.New("k3s does not appear to be installed on this node")
 
 // Uninstall runs K3s's own generated uninstall script on the target node,
-// removing the service, binaries, and data.
-func Uninstall(c rootRunner) error {
-	out, err := c.RunAsRoot(fmt.Sprintf("if test -x %s; then printf installed; fi", uninstallScriptPath))
+// removing the service, binaries, and data. Servers and agents each get
+// their own script.
+func Uninstall(c preflightRunner) error {
+	installation, err := DetectInstallation(c)
 	if err != nil {
-		return fmt.Errorf("checking for k3s uninstall script: %w", err)
-	}
-	if strings.TrimSpace(out) != "installed" {
-		return fmt.Errorf("k3s does not appear to be installed on this node (no %s)", uninstallScriptPath)
+		return err
 	}
 
-	out, err = c.RunAsRoot(uninstallScriptPath)
+	var script string
+	switch installation {
+	case InstalledServer:
+		script = uninstallScriptPath
+	case InstalledAgent:
+		script = agentUninstallScriptPath
+	default:
+		return fmt.Errorf("%w (no %s or %s)", ErrNotInstalled, uninstallScriptPath, agentUninstallScriptPath)
+	}
+
+	out, err := c.RunAsRoot(script)
 	if err != nil {
 		return fmt.Errorf("uninstalling k3s: %w\n%s", err, out)
 	}

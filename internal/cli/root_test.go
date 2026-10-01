@@ -52,3 +52,21 @@ func TestArgumentErrorIsReturnedWithoutPrinting(t *testing.T) {
 		t.Fatalf("Cobra duplicated the returned error: %q", stderr.String())
 	}
 }
+
+func TestUpDownWithoutDefinition(t *testing.T) {
+	t.Chdir(t.TempDir())
+	for _, sub := range []string{"up", "down"} {
+		cmd := NewRootCmd()
+		var out, stderr bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&stderr)
+		cmd.SetArgs([]string{sub})
+		err := cmd.Execute()
+		if err == nil || !strings.Contains(err.Error(), "no quick8s.yaml in the current directory") {
+			t.Fatalf("%s: unexpected error: %v", sub, err)
+		}
+		if out.Len() != 0 {
+			t.Fatalf("%s: wrote to stdout: %q", sub, out.String())
+		}
+	}
+}

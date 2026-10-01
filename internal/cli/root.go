@@ -14,6 +14,8 @@ func NewRootCmd() *cobra.Command {
 		SilenceErrors: true, // main owns error reporting.
 	}
 
+	root.AddCommand(newUpCmd())
+	root.AddCommand(newDownCmd())
 	root.AddCommand(newBootstrapCmd())
 	root.AddCommand(newJoinCmd())
 	root.AddCommand(newKubeconfigCmd())

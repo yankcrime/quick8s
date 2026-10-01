@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"net"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -45,6 +46,15 @@ func newBootstrapCmd() *cobra.Command {
 			return fmt.Errorf("specify a target host, or at least one --control-plane")
 		}
 
+		// Read the config up front so a bad path fails before touching nodes.
+		var config []byte
+		if configFile != "" {
+			var err error
+			if config, err = os.ReadFile(configFile); err != nil {
+				return fmt.Errorf("reading config file: %w", err)
+			}
+		}
+
 		initiator, additionalControlPlanes := controlPlanes[0], controlPlanes[1:]
 		target := ssh.target(initiator)
 
@@ -56,25 +66,10 @@ func newBootstrapCmd() *cobra.Command {
 
 		// Status goes to stderr so stdout stays clean for the
 		// kubeconfig, e.g. `quick8s bootstrap host > kubeconfig.yaml`.
-		cmd.PrintErrf("Connected to %s, running preflight checks...\n", target.Host)
-		if err := k3s.Preflight(client, indented(cmd)); err != nil {
-			return err
-		}
-
-		if configFile != "" {
-			cmd.PrintErrf("Pushing config file %s to node...\n", configFile)
-			if err := k3s.PushConfigFile(client, configFile); err != nil {
-				return err
-			}
-		}
-
-		if err := slowStep(cmd, "Installing K3s...", func(progress k3s.Progress) error {
-			return k3s.Install(client, k3s.InstallOpts{
-				Version:     k3sVersion,
-				ClusterInit: len(additionalControlPlanes) > 0,
-				TLSSAN:      target.Host,
-				NodeIP:      nodeIPFor(target.Host),
-			}, progress)
+		cmd.PrintErrf("Connected to %s.\n", target.Host)
+		if err := initControlPlane(cmd, client, target.Host, config, k3s.InstallOpts{
+			Version:     k3sVersion,
+			ClusterInit: len(additionalControlPlanes) > 0,
 		}); err != nil {
 			return err
 		}
@@ -87,7 +82,7 @@ func newBootstrapCmd() *cobra.Command {
 			}
 
 			serverURL := "https://" + net.JoinHostPort(target.Host, "6443")
-			if err := joinControlPlanes(cmd, ssh, additionalControlPlanes, configFile, k3s.ControlPlaneOpts{
+			if err := joinControlPlanes(cmd, ssh, additionalControlPlanes, config, k3s.ControlPlaneOpts{
 				Version:   k3sVersion,
 				ServerURL: serverURL,
 				Token:     token,
@@ -95,7 +90,7 @@ func newBootstrapCmd() *cobra.Command {
 				return err
 			}
 
-			if err := joinWorkers(cmd, ssh, workers, k3s.AgentOpts{
+			if err := joinWorkers(cmd, ssh, workers, nil, k3s.AgentOpts{
 				Version:   k3sVersion,
 				ServerURL: serverURL,
 				Token:     token,

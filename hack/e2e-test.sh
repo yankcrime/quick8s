@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end test harness for quick8s: spins up a real VM via colima (macOS),
-# runs bootstrap -> kubeconfig -> teardown against it over SSH on its real
+# runs bootstrap -> kubeconfig -> teardown, then the same lifecycle through a
+# quick8s.yaml with up -> up (no-op) -> down, against it over SSH on its real
 # network address, and verifies each step actually did what it claims.
 #
 # Requires: colima, jq, go.
@@ -90,5 +91,44 @@ if "$QUICK8S" kubeconfig "$IP" --ssh-user "$SSH_USER" --ssh-key "$SSH_KEY" >/dev
   fail "kubeconfig still fetchable after teardown"
 fi
 log "confirmed: K3s is gone"
+
+CLUSTER_DIR="$(mktemp -d)"
+trap 'rm -rf "$CLUSTER_DIR"; cleanup' EXIT
+cat >"$CLUSTER_DIR/quick8s.yaml" <<EOF
+cluster:
+  ssh:
+    user: $SSH_USER
+    key: $SSH_KEY
+  nodes:
+    controlPlane:
+      - $IP
+k3s:
+  server:
+    node-label:
+      - quick8s-e2e=true
+EOF
+
+log "Running: quick8s up (from a directory holding quick8s.yaml)"
+KUBECONFIG_OUT3="$(cd "$CLUSTER_DIR" && "$QUICK8S" up)"
+grep -q "apiVersion: v1" <<<"$KUBECONFIG_OUT3" || fail "up did not print a valid-looking kubeconfig"
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$SSH_KEY" "$SSH_USER@$IP" \
+  sudo cat /etc/rancher/k3s/config.yaml | grep -q "quick8s-e2e=true" || fail "up did not install k3s.server as the node's K3s config"
+log "up OK, kubeconfig looks valid and K3s config was pushed"
+
+log "Running: quick8s up again (should be a no-op)"
+UP_AGAIN_ERR="$(cd "$CLUSTER_DIR" && "$QUICK8S" up 2>&1 >/dev/null)"
+grep -q "nothing to do" <<<"$UP_AGAIN_ERR" || fail "second up was not a no-op: $UP_AGAIN_ERR"
+log "second up OK, nothing to do"
+
+log "Running: quick8s down -y"
+(cd "$CLUSTER_DIR" && "$QUICK8S" down -y)
+if "$QUICK8S" kubeconfig "$IP" --ssh-user "$SSH_USER" --ssh-key "$SSH_KEY" >/dev/null 2>&1; then
+  fail "kubeconfig still fetchable after down"
+fi
+log "down OK, K3s is gone"
+
+log "Running: quick8s down -y again (should skip the already-clean node)"
+(cd "$CLUSTER_DIR" && "$QUICK8S" down -y)
+log "second down OK"
 
 log "PASS"

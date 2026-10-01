@@ -10,6 +10,7 @@ making structural changes.
 cmd/quick8s        entrypoint only, wires up the Cobra root command
 internal/cli        Cobra command definitions — flag parsing + orchestration only
 internal/node        Target (host/port/user/key) + Client (SSH connection wrapper)
+internal/cluster     quick8s.yaml: loading/validation (Spec) and up's reconciliation (Plan)
 internal/k3s         K3s-specific operations taking narrow, consumer-defined remote interfaces
 internal/shell       literal POSIX shell argument quoting shared by node and k3s
 hack/                dev/test scripts (currently just the e2e harness)
@@ -82,6 +83,50 @@ stripped. The last installer line, `systemd: Starting k3s`, blocks until K3s
 reports ready, and that is where the heartbeat matters.
 Payload writes return their errors. Cobra has `SilenceErrors` enabled so
 `main` prints each returned error once.
+
+## Declarative `up`/`down` from `quick8s.yaml`
+
+`up`/`down` read a cluster definition (`quick8s.yaml` in cwd, or `-f`),
+Terraform-style. Two top-level keys, a deliberate shape: `cluster:` holds
+the version, SSH settings, and nodes as plain address lists under
+`cluster.nodes.controlPlane` and `cluster.nodes.worker` (both singular);
+`k3s:` holds K3s's own config, kept apart from quick8s's settings. `internal/cluster` owns the file format and is pure (no
+SSH): `Load` validates strictly (`KnownFields`, so typos fail loudly), and
+`Spec.Plan` turns per-node install state into what to do. Keep the
+planning logic there and table-tested; `internal/cli/up.go` just gathers
+state, runs the plan, and reuses the same `initControlPlane`/
+`addControlPlane`/`addWorker` helpers as `bootstrap`.
+
+Decisions worth preserving:
+
+- **No state file — the nodes are the state.** `k3s.DetectInstallation`
+  tells server from agent by which uninstall script the installer left
+  (`k3s-uninstall.sh` vs `k3s-agent-uninstall.sh`). `up` only *adds*: nodes
+  already in their declared role are skipped, a role mismatch is an error.
+  Removing nodes dropped from the file would need a record of them, which
+  is the point at which a state file (or querying the cluster) comes in.
+- **Probe everything before mutating anything.** `up` dials every node and
+  detects its state first, holding the connections open for the install
+  phase (one dial per node, so one passphrase prompt per node).
+- **The join target is the first control plane that's already a server**,
+  not blindly the first listed — otherwise reordering the file, or listing
+  a new node first, would initialize a second cluster.
+- **Joining nodes install the version the server is running**
+  (`k3s.Version`), not `kubernetesVersion`: `up` doesn't upgrade, and a
+  kubelet newer than its apiserver is outside Kubernetes' skew policy. It
+  warns on drift instead.
+- **Adding a control plane to a sqlite (single-server) cluster is refused
+  up front** (`k3s.EmbeddedEtcd`) rather than letting the join hang in
+  systemd. The escape hatch is `cluster-init: true` under `k3s.server`.
+- **`k3s.server`/`k3s.agent` are opaque** `yaml.Node`s re-encoded as-is
+  (key order and styles kept) and pushed like `--config-file` — the same
+  "don't mirror K3s" philosophy as below. Don't add typed K3s fields.
+- **`down` is best-effort across nodes** (`errors.Join`), workers first,
+  treats `k3s.ErrNotInstalled` as already done, and confirms like
+  `teardown`. Re-running an interrupted `down` must be safe.
+
+YAML is `go.yaml.in/yaml/v3`, the maintained successor to the archived
+`gopkg.in/yaml.v3`.
 
 ## Design philosophy: don't grow the flag surface to mirror K3s
 
@@ -174,7 +219,7 @@ in question.
 
 ## Destructive commands require confirmation
 
-`teardown` prompts (`internal/cli/confirm.go`) before running the uninstall
+`teardown` and `down` prompt (`internal/cli/confirm.go`) before running the uninstall
 script, skippable with `-y`/`--yes`. Any future destructive command (cluster
 delete, node removal, etc.) should follow the same pattern rather than
 executing silently.

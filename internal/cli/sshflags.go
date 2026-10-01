@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"quick8s/internal/cluster"
 	"quick8s/internal/node"
 )
 
@@ -36,6 +37,19 @@ func (f *sshFlags) target(host string) node.Target {
 		User:    f.user,
 		KeyPath: f.keyPath,
 	}
+}
+
+// specSSH builds connection settings from a cluster definition, applying
+// the same defaults as the SSH flags.
+func specSSH(s cluster.SSH) *sshFlags {
+	f := &sshFlags{user: s.User, port: s.Port, keyPath: s.Key}
+	if f.user == "" {
+		f.user = defaultSSHUser()
+	}
+	if f.port == 0 {
+		f.port = 22
+	}
+	return f
 }
 
 // nodeIPFor returns host if it's a literal IP address, else "". K3s's
