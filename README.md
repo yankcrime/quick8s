@@ -6,8 +6,9 @@ A CLI that simplifies bootstrapping a Kubernetes cluster with [K3s](https://k3s.
 
 Early scaffold. Current scope: bootstrapping a K3s control plane on a remote
 host identified by hostname or IP, optionally forming an HA (multi-node)
-control plane and/or joining worker nodes to it — either imperatively with
-`bootstrap`, or declaratively from a `quick8s.yaml` with `up`/`down`.
+control plane and/or joining worker nodes to it, and upgrading it later —
+either imperatively with `bootstrap`/`upgrade`, or declaratively from a
+`quick8s.yaml` with `up`/`down`.
 
 ## Declarative clusters: `quick8s.yaml`, `up` and `down`
 
@@ -16,7 +17,7 @@ the directory holding it:
 
 ```yaml
 cluster:
-  kubernetesVersion: v1.33.4+k3s1   # K3s release; omit for latest stable
+  kubernetesVersion: v1.33.4+k3s1   # K3s release; omit for latest stable, change to upgrade
 
   ssh:                              # optional; same defaults as the --ssh-* flags
     user: ubuntu
@@ -38,7 +39,7 @@ k3s:                                # K3s's own config.yaml, passed through as-i
 ```
 
 ```
-quick8s up > kubeconfig.yaml      # create the cluster, or add new nodes to it
+quick8s up > kubeconfig.yaml      # create the cluster, or bring it in line with the file
 quick8s down                      # destroy it (prompts; -y to skip)
 ```
 
@@ -46,26 +47,61 @@ Both take `-f/--file` to point at a definition elsewhere. See
 [`examples/quick8s.yaml`](examples/quick8s.yaml) for a commented example.
 
 **`up`** connects to every node and checks what's installed before changing
-anything, so an unreachable node or a node running K3s in the wrong role
-fails with nothing touched. Nodes already running K3s in their listed role
-are left alone; the rest are installed — the first control plane
-initializes the cluster (with embedded etcd when there's more than one
-control plane), and the others join it. So `up` is safe to re-run, and
-adding a node to the file and running `up` again joins just that node.
-There's no state file: the nodes themselves are the state.
+anything, so an unreachable node, a node running K3s in the wrong role, or
+an unsupported upgrade fails with nothing touched. Then it makes the nodes
+match the file:
+
+- **New nodes** get K3s installed — the first control plane initializes the
+  cluster (with embedded etcd when there's more than one control plane), and
+  the others join it. So adding a node to the file and running `up` again
+  joins just that node.
+- **Existing nodes** are upgraded when `kubernetesVersion` changes, and get
+  their K3s config replaced (and K3s restarted) when the `k3s` section for
+  their role changes. Config is compared by content, so reformatting or
+  editing comments in `quick8s.yaml` doesn't restart anything; removing a
+  section removes the node's config file.
+
+Changes to existing nodes are listed and confirmed first (`-y` to skip),
+since each restarts K3s on its node. They're made one node at a time,
+control planes before workers, stopping at the first failure — so a bad
+release or config takes down one node rather than the cluster — and before
+any new node joins, so new nodes join an already-upgraded cluster.
+
+Upgrades are validated against Kubernetes' version skew policy before
+anything happens: **no downgrades, and no skipping a minor version** (to go
+from v1.33 to v1.35, set a v1.34 release, run `up`, then set v1.35). Without
+`kubernetesVersion`, `up` never upgrades, and new nodes install whatever
+version the cluster already runs. Nodes already matching the file are left
+alone, so `up` is safe to re-run, including after an interrupted upgrade.
+There's no local state file: the nodes themselves are the state. Before an
+update, quick8s writes a small pending marker on that node, and removes it
+only after the running service passes readiness checks at the expected
+version. A failed or interrupted update is therefore retried even when its
+binary or config file already matches. Removing `kubernetesVersion` still
+allows an already-pending upgrade to finish.
+
+Readiness checks run after both upgrades and config restarts, including on
+OpenRC: control planes must answer the API readiness endpoint at the target
+version; workers must have a healthy local kubelet and report Ready at that
+version. These checks use K3s's default file paths and the worker's default
+local kubelet health endpoint (`127.0.0.1:10248`), with a three-minute wait
+and a timeout on each HTTP request.
 
 What `up` deliberately doesn't do (yet):
 
 - **Remove nodes** dropped from the file — there's no record of them. Use
   `teardown <host>` on the node.
-- **Upgrade or reconfigure** existing nodes when `kubernetesVersion` or the
-  `k3s` sections change. New nodes always install the version the cluster
-  is already running (so they can't end up newer than the control plane),
-  and `up` warns if that differs from `kubernetesVersion`.
+- **Drain nodes** before upgrading or restarting them. K3s restarts in
+  place and running containers keep running, but pods may briefly lose the
+  node's API access while it restarts.
 - **Grow a single-server cluster into HA.** A cluster created with one
   control plane uses sqlite, which other servers can't join; `up` refuses
   with an explanation. If you expect to add control planes later, set
   `cluster-init: true` under `k3s.server` when first creating it.
+
+Some K3s settings (e.g. `cluster-cidr`) can't change once a cluster
+exists; quick8s doesn't know which, and K3s will refuse to start with them
+— on the first node changed, since `up` stops there.
 
 **`down`** uninstalls K3s from every node in the file, workers first and the
 initializing control plane last. Nodes without K3s are skipped, and one
@@ -184,6 +220,34 @@ quick8s issue: `colima delete -f` (no `-d`) leaves the VM's disk on disk, so
 a same-named profile's "fresh" VM silently resumes on old state. See
 CLAUDE.md if you hit this.
 
+### Upgrading
+
+`upgrade` is the imperative counterpart to changing `kubernetesVersion` and
+running `up`, for clusters created with `bootstrap`. It names nodes exactly
+like `bootstrap` does, and the first `--control-plane` is the node the
+others are pointed at:
+
+```
+go run ./cmd/quick8s upgrade <host-or-ip> --k3s-version v1.34.1+k3s1
+go run ./cmd/quick8s upgrade --k3s-version v1.34.1+k3s1 \
+  --control-plane <cp1>,<cp2>,<cp3> --worker <worker1>,<worker2>
+```
+
+The same checks apply as for `up` — every node is inspected and the upgrade
+validated (no downgrades, no skipping minors) before anything changes; nodes
+already on the target release are skipped; the rest are upgraded one at a
+time, control planes first, after a confirmation prompt (`-y` to skip).
+`upgrade` changes only the version, never K3s config files.
+
+Under the hood, both `up` and `upgrade` use K3s's own manual upgrade path:
+re-running the install script with the new `INSTALL_K3S_VERSION`. The
+script rewrites the K3s service from its arguments each time, so quick8s
+passes exactly what it installed the node with (role, `--server`, token,
+`--tls-san`, `--node-ip`) — an upgrade doesn't drop them. Each node is
+checked to run the new release afterwards. Failed updates remain pending on
+the affected node; retries force the installer to restart K3s even if its
+files were already replaced by the previous attempt.
+
 Other commands:
 
 ```
@@ -194,12 +258,19 @@ go run ./cmd/quick8s teardown <host-or-ip>       # uninstall K3s, server or work
 ## Testing
 
 `go test ./...` runs local tests for shell quoting, installer arguments,
-privilege selection, SSH output and authentication cleanup, and CLI output.
+privilege selection, SSH output and authentication cleanup, CLI output,
+`up`'s planning (joins, upgrades, config drift), and the version rules for
+upgrades.
 The SSH tests use a local server and simulated sudo; they do not install K3s
 or require root. Run `go vet ./...` for static checks.
 
-`hack/e2e-test.sh` (macOS only) runs the full lifecycle — bootstrap,
-kubeconfig, teardown, then up, up again (a no-op), down — against a real, disposable VM. It uses
+`hack/e2e-test.sh` (macOS only) runs the full lifecycle — bootstrap at an
+older release, a refused downgrade, upgrade, kubeconfig, teardown, then up,
+up again (a no-op), up with a new `kubernetesVersion` and K3s config
+(refused without confirmation, then applied), recovery from an injected
+config-only restart failure, down — against a real,
+disposable VM. `OLD_VERSION`/`NEW_VERSION` pick the releases to upgrade
+between. It uses
 [colima](https://github.com/abiosoft/colima) with `--network-address
 --network-mode bridged` to give the VM a real LAN IP via DHCP, so the test
 goes over an actual network hop rather than a forwarded loopback port, same

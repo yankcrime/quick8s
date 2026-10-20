@@ -22,12 +22,7 @@ type ControlPlaneOpts struct {
 	NodeIP string
 }
 
-// JoinControlPlane installs K3s in server mode on the target node, joining
-// it to the cluster at ServerURL as an additional control plane / etcd
-// member. The initiating control plane must have been installed with
-// InstallOpts.ClusterInit for this to work.
-func JoinControlPlane(c rootStreamer, opts ControlPlaneOpts, progress Progress) error {
-	env := []string{"K3S_TOKEN=" + opts.Token}
+func (opts ControlPlaneOpts) invocation() invocation {
 	args := []string{"server", "--server", opts.ServerURL}
 	if opts.TLSSAN != "" {
 		args = append(args, "--tls-san", opts.TLSSAN)
@@ -35,8 +30,15 @@ func JoinControlPlane(c rootStreamer, opts ControlPlaneOpts, progress Progress) 
 	if opts.NodeIP != "" {
 		args = append(args, "--node-ip", opts.NodeIP)
 	}
+	return invocation{version: opts.Version, env: []string{"K3S_TOKEN=" + opts.Token}, args: args}
+}
 
-	if err := runInstall(c, opts.Version, env, args, progress); err != nil {
+// JoinControlPlane installs K3s in server mode on the target node, joining
+// it to the cluster at ServerURL as an additional control plane / etcd
+// member. The initiating control plane must have been installed with
+// InstallOpts.ClusterInit for this to work.
+func JoinControlPlane(c rootStreamer, opts ControlPlaneOpts, progress Progress) error {
+	if err := runInstall(c, opts.invocation(), progress); err != nil {
 		return fmt.Errorf("joining control plane: %w", err)
 	}
 	return nil

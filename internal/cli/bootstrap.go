@@ -37,19 +37,14 @@ func newBootstrapCmd() *cobra.Command {
 	cmd.Flags().StringSliceVar(&controlPlanes, "control-plane", nil, "hostname or IP of a control plane node; the first one given initializes the cluster, any more form an HA cluster with embedded etcd (repeatable, or comma-separated)")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		if len(args) == 1 {
-			if len(controlPlanes) > 0 || len(workers) > 0 {
-				return fmt.Errorf("can't combine a positional target with --control-plane or --worker; use --control-plane %s instead", args[0])
-			}
-			controlPlanes = []string{args[0]}
-		} else if len(controlPlanes) == 0 {
-			return fmt.Errorf("specify a target host, or at least one --control-plane")
+		controlPlanes, err := resolveControlPlanes(args, controlPlanes, workers)
+		if err != nil {
+			return err
 		}
 
 		// Read the config up front so a bad path fails before touching nodes.
 		var config []byte
 		if configFile != "" {
-			var err error
 			if config, err = os.ReadFile(configFile); err != nil {
 				return fmt.Errorf("reading config file: %w", err)
 			}
@@ -109,4 +104,21 @@ func newBootstrapCmd() *cobra.Command {
 	}
 
 	return cmd
+}
+
+// resolveControlPlanes applies the node-naming rule shared by bootstrap and
+// upgrade: a lone positional target is single-node shorthand for one
+// control plane; anything more names every control plane with
+// --control-plane, and the two forms never mix.
+func resolveControlPlanes(args, controlPlanes, workers []string) ([]string, error) {
+	if len(args) == 1 {
+		if len(controlPlanes) > 0 || len(workers) > 0 {
+			return nil, fmt.Errorf("can't combine a positional target with --control-plane or --worker; use --control-plane %s instead", args[0])
+		}
+		return []string{args[0]}, nil
+	}
+	if len(controlPlanes) == 0 {
+		return nil, fmt.Errorf("specify a target host, or at least one --control-plane")
+	}
+	return controlPlanes, nil
 }

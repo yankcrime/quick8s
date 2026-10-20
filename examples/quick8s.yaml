@@ -2,7 +2,8 @@
 # this file to create the cluster, and `quick8s down` to destroy it.
 cluster:
   # K3s release to install (https://github.com/k3s-io/k3s/releases). Omit for
-  # the latest stable release at the time the cluster is created.
+  # the latest stable release at the time the cluster is created. Change it
+  # and run `quick8s up` to upgrade, one minor version at a time.
   kubernetesVersion: v1.33.4+k3s1
 
   # Optional. Authentication always tries the running SSH agent first; key is
@@ -25,7 +26,8 @@ cluster:
 
 # K3s's own configuration (https://docs.k3s.io/installation/configuration#configuration-file),
 # written to /etc/rancher/k3s/config.yaml before K3s first starts. Keys are
-# K3s CLI flags without the leading dashes.
+# K3s CLI flags without the leading dashes. Changing a section and running
+# `quick8s up` rewrites the file and restarts K3s on that role's nodes.
 k3s:
   # For control plane (server) nodes.
   server:
