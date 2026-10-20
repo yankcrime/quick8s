@@ -9,10 +9,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"go.yaml.in/yaml/v3"
+
+	"quick8s/internal/k3s"
 )
 
 // DefaultFile is the cluster definition `up` and `down` read from the
@@ -21,8 +22,9 @@ const DefaultFile = "quick8s.yaml"
 
 // Spec is a validated cluster definition.
 type Spec struct {
-	// KubernetesVersion is the K3s release to install, e.g.
-	// "v1.33.4+k3s1". Empty means K3s's latest stable release.
+	// KubernetesVersion is the K3s release to install, or upgrade existing
+	// nodes to, e.g. "v1.33.4+k3s1". Empty means K3s's latest stable
+	// release when creating the cluster, and never upgrading it.
 	KubernetesVersion string
 	SSH               SSH
 	// ControlPlanes lists K3s server nodes. The first one initializes a new
@@ -30,9 +32,18 @@ type Spec struct {
 	ControlPlanes []Node
 	Workers       []Node
 	// ServerConfig and AgentConfig are K3s config.yaml contents for control
-	// plane and worker nodes respectively, or nil when not given.
+	// plane and worker nodes respectively, or nil when not given, in which
+	// case those nodes shouldn't have a config file.
 	ServerConfig []byte
 	AgentConfig  []byte
+}
+
+// Config returns the K3s config for control plane or worker nodes.
+func (s *Spec) Config(controlPlane bool) []byte {
+	if controlPlane {
+		return s.ServerConfig
+	}
+	return s.AgentConfig
 }
 
 // SSH holds connection settings shared by every node. Zero values mean
@@ -72,10 +83,6 @@ type file struct {
 	} `yaml:"k3s"`
 }
 
-// k3sVersion matches K3s release tags; the "+k3sN" suffix is required to
-// download a release.
-var k3sVersion = regexp.MustCompile(`^v\d+\.\d+\.\d+(-rc\d+)?\+k3s\d+$`)
-
 // Load reads and validates the cluster definition at path.
 func Load(path string) (*Spec, error) {
 	data, err := os.ReadFile(path)
@@ -107,8 +114,10 @@ func parse(data []byte, dir string) (*Spec, error) {
 	}
 
 	c := f.Cluster
-	if c.KubernetesVersion != "" && !k3sVersion.MatchString(c.KubernetesVersion) {
-		return nil, fmt.Errorf("cluster.kubernetesVersion %q isn't a K3s release; use the full release tag, e.g. v1.33.4+k3s1 (see https://github.com/k3s-io/k3s/releases)", c.KubernetesVersion)
+	if c.KubernetesVersion != "" {
+		if _, err := k3s.ParseRelease(c.KubernetesVersion); err != nil {
+			return nil, fmt.Errorf("cluster.kubernetesVersion: %w", err)
+		}
 	}
 	if c.SSH.Port < 0 || c.SSH.Port > 65535 {
 		return nil, fmt.Errorf("cluster.ssh.port %d is out of range", c.SSH.Port)

@@ -18,6 +18,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newDownCmd())
 	root.AddCommand(newBootstrapCmd())
 	root.AddCommand(newJoinCmd())
+	root.AddCommand(newUpgradeCmd())
 	root.AddCommand(newKubeconfigCmd())
 	root.AddCommand(newTeardownCmd())
 	root.AddCommand(newVersionCmd())

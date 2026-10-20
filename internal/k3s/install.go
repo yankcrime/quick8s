@@ -35,10 +35,22 @@ type InstallOpts struct {
 	NodeIP string
 }
 
-// Install downloads and runs the official K3s install script on the target
-// node via the given SSH client, reporting the script's output to progress
-// as it runs.
-func Install(c rootStreamer, opts InstallOpts, progress Progress) error {
+// Options is how K3s is installed on a node: InstallOpts for the server
+// that initializes a cluster, ControlPlaneOpts for a server joining one, or
+// AgentOpts for a worker.
+type Options interface {
+	invocation() invocation
+}
+
+// invocation is a K3s installer run: the release to install, extra
+// environment for the script, and the arguments K3s itself starts with.
+type invocation struct {
+	version string
+	env     []string
+	args    []string
+}
+
+func (opts InstallOpts) invocation() invocation {
 	args := []string{"server"}
 	if opts.ClusterInit {
 		args = append(args, "--cluster-init")
@@ -49,8 +61,14 @@ func Install(c rootStreamer, opts InstallOpts, progress Progress) error {
 	if opts.NodeIP != "" {
 		args = append(args, "--node-ip", opts.NodeIP)
 	}
+	return invocation{version: opts.Version, args: args}
+}
 
-	if err := runInstall(c, opts.Version, nil, args, progress); err != nil {
+// Install downloads and runs the official K3s install script on the target
+// node via the given SSH client, reporting the script's output to progress
+// as it runs.
+func Install(c rootStreamer, opts InstallOpts, progress Progress) error {
+	if err := runInstall(c, opts.invocation(), progress); err != nil {
 		return fmt.Errorf("installing k3s: %w", err)
 	}
 	return nil
@@ -63,16 +81,16 @@ func Install(c rootStreamer, opts InstallOpts, progress Progress) error {
 // narrates each phase (download, verify, install, service start), and the
 // final service start blocks until K3s reports ready, which can take a while.
 // Failures still carry the script's stderr via the returned error.
-func runInstall(c rootStreamer, version string, env, args []string, progress Progress) error {
+func runInstall(c rootStreamer, inv invocation, progress Progress) error {
 	script := `installer=$(curl -sfL https://get.k3s.io) && printf '%s\n' "$installer" | env`
-	if version != "" {
-		script += " " + shell.Quote("INSTALL_K3S_VERSION="+version)
+	if inv.version != "" {
+		script += " " + shell.Quote("INSTALL_K3S_VERSION="+inv.version)
 	}
-	for _, value := range env {
+	for _, value := range inv.env {
 		script += " " + shell.Quote(value)
 	}
 	script += " sh -s -"
-	for _, arg := range args {
+	for _, arg := range inv.args {
 		script += " " + shell.Quote(arg)
 	}
 	out := &installerOutput{progress: progress}

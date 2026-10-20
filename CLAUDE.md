@@ -101,10 +101,27 @@ Decisions worth preserving:
 
 - **No state file — the nodes are the state.** `k3s.DetectInstallation`
   tells server from agent by which uninstall script the installer left
-  (`k3s-uninstall.sh` vs `k3s-agent-uninstall.sh`). `up` only *adds*: nodes
-  already in their declared role are skipped, a role mismatch is an error.
-  Removing nodes dropped from the file would need a record of them, which
-  is the point at which a state file (or querying the cluster) comes in.
+  (`k3s-uninstall.sh` vs `k3s-agent-uninstall.sh`); `up`'s probe also reads
+  each installed node's version and `config.yaml` into a
+  `cluster.NodeState`. A role mismatch is an error. Removing nodes dropped
+  from the file would need a record of them, which is the point at which a
+  state file (or querying the cluster) comes in.
+- **`up` converges existing nodes, it doesn't only add.** `Spec.Plan`
+  emits an `Update` per installed node whose version differs from
+  `kubernetesVersion` or whose config differs from its role's `k3s`
+  section. Updates are confirmed (`-y` skips), then applied one node at a
+  time, control planes first, stopping at the first failure, and *before*
+  any joins so new nodes join an already-upgraded cluster. Empty
+  `kubernetesVersion` means "never upgrade", not "chase latest".
+- **Upgrade validation lives in `k3s.CheckUpgrade`** (shared by `up` and
+  `upgrade`) and runs in planning, before anything changes: no downgrades,
+  no skipping a minor version. Keep it there rather than discovering the
+  problem mid-rollout.
+- **Config drift is compared semantically** (`sameConfig`: YAML-decoded
+  and deep-compared), not byte-for-byte, so comment or formatting edits in
+  `quick8s.yaml` don't trigger a rolling restart. A missing `k3s.server`/
+  `k3s.agent` section means the nodes shouldn't have a config file, so it
+  gets removed.
 - **Probe everything before mutating anything.** `up` dials every node and
   detects its state first, holding the connections open for the install
   phase (one dial per node, so one passphrase prompt per node).
@@ -112,9 +129,10 @@ Decisions worth preserving:
   not blindly the first listed — otherwise reordering the file, or listing
   a new node first, would initialize a second cluster.
 - **Joining nodes install the version the server is running**
-  (`k3s.Version`), not `kubernetesVersion`: `up` doesn't upgrade, and a
-  kubelet newer than its apiserver is outside Kubernetes' skew policy. It
-  warns on drift instead.
+  (`k3s.Version`, queried *after* the upgrades), not `kubernetesVersion`
+  directly: when `kubernetesVersion` is empty the cluster's version is
+  whatever it was created with, and a kubelet newer than its apiserver is
+  outside Kubernetes' skew policy.
 - **Adding a control plane to a sqlite (single-server) cluster is refused
   up front** (`k3s.EmbeddedEtcd`) rather than letting the join hang in
   systemd. The escape hatch is `cluster-init: true` under `k3s.server`.
@@ -136,6 +154,47 @@ doesn't need a flag for every K3s server option. K3s reads that file itself,
 independent of the install script — quick8s just needs to put it in place
 before first start. Prefer this pattern over adding new passthrough flags for
 K3s-specific behavior.
+
+## Upgrades re-run the installer with the node's original arguments
+
+An upgrade (`k3s.Upgrade`, used by both `up` and `quick8s upgrade`) is
+K3s's documented manual upgrade: re-run the install script with a new
+`INSTALL_K3S_VERSION`. The catch is that **the installer rewrites the
+systemd unit and its env file from whatever it's given on every run**, so
+an upgrade that omitted `--tls-san`/`--node-ip`, a joiner's `--server` and
+`K3S_TOKEN`, or an agent's `K3S_URL` would silently strip them from the
+node. That's why `InstallOpts`/`ControlPlaneOpts`/`AgentOpts` all produce
+an `invocation` (implementing `k3s.Options`), and `cli.reinstall.options`
+rebuilds exactly what `initControlPlane`/`addControlPlane`/`addWorker`
+would install the node with: the join target is reinstalled as the
+initializing server (`--cluster-init` iff `k3s.EmbeddedEtcd`), every other
+server with `--server <join target>`. If you change how any role is
+installed, change it in the opts' `invocation()` so installs and upgrades
+can't drift apart. After an upgrade, the node must report the new release
+or it's an error.
+
+Config-only changes don't re-run the installer — they push the file and
+`k3s.Restart` the service (`k3s` or `k3s-agent`, systemd or OpenRC). When
+both change, the config is pushed first and the installer's own restart
+picks it up, so the node restarts once.
+
+`cli.applyUpdate` writes `/etc/rancher/k3s/.quick8s-update-pending` before
+changing config or re-running the installer, and clears it only after
+`k3s.WaitReady` succeeds. The marker contains the upgrade target, or an
+empty line for a config-only restart. Probe it before planning: disk files
+can match after a failed restart, and must not make a retry a no-op.
+Upgrades force the installer's restart even when its files are unchanged.
+Readiness checks use K3s's default paths and kubelet health port: servers
+check their local API's `/readyz` and `/version`; agents check local kubelet
+health plus their own Node's Ready condition and kubelet version, using the
+kubelet certificate to discover the node name. Polling is bounded and
+cancellable; never proceed to another node when readiness fails.
+
+`quick8s upgrade` is the imperative counterpart for `bootstrap`-created
+clusters. It reuses `bootstrap`'s node-naming rule via
+`resolveControlPlanes` (single positional target, or every control plane
+via `--control-plane`, never both) and only ever changes the version, not
+config files.
 
 ## Worker join: shared logic, two entry points
 
@@ -220,7 +279,9 @@ in question.
 ## Destructive commands require confirmation
 
 `teardown` and `down` prompt (`internal/cli/confirm.go`) before running the uninstall
-script, skippable with `-y`/`--yes`. Any future destructive command (cluster
+script, skippable with `-y`/`--yes`. `upgrade`, and `up` when it would change
+nodes already running K3s, prompt the same way, since both restart K3s on
+live nodes. Any future destructive command (cluster
 delete, node removal, etc.) should follow the same pattern rather than
 executing silently.
 

@@ -70,3 +70,25 @@ func TestUpDownWithoutDefinition(t *testing.T) {
 		}
 	}
 }
+
+func TestUpgradeValidatesArgumentsBeforeConnecting(t *testing.T) {
+	for _, tt := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"upgrade", "host"}, `"k3s-version" not set`},
+		{[]string{"upgrade", "--k3s-version", "v1.34.1+k3s1"}, "at least one --control-plane"},
+		{[]string{"upgrade", "host", "--worker", "w", "--k3s-version", "v1.34.1+k3s1"}, "can't combine"},
+		{[]string{"upgrade", "host", "--k3s-version", "v1.34"}, "full release tag"},
+	} {
+		cmd := NewRootCmd()
+		var out, stderr bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&stderr)
+		cmd.SetArgs(tt.args)
+		err := cmd.Execute()
+		if err == nil || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("%v: got %v, want error containing %q", tt.args, err, tt.want)
+		}
+	}
+}

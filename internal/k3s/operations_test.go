@@ -42,6 +42,17 @@ func TestInstallPreservesEnvironmentAndArguments(t *testing.T) {
 		{"control plane", func(c rootStreamer) error {
 			return JoinControlPlane(c, ControlPlaneOpts{Version: literal, ServerURL: server, Token: literal, TLSSAN: literal, NodeIP: "2001:db8::3"}, nil)
 		}, []string{literal, "", literal, "server", "--server", server, "--tls-san", literal, "--node-ip", "2001:db8::3"}},
+		// Upgrades repeat a node's install options exactly, since the
+		// installer rewrites the service from them.
+		{"upgrade server", func(c rootStreamer) error {
+			return Upgrade(c, InstallOpts{Version: literal, ClusterInit: true, TLSSAN: literal, NodeIP: "2001:db8::1"}, nil)
+		}, []string{literal, "", "", "server", "--cluster-init", "--tls-san", literal, "--node-ip", "2001:db8::1"}},
+		{"upgrade control plane", func(c rootStreamer) error {
+			return Upgrade(c, ControlPlaneOpts{Version: literal, ServerURL: server, Token: literal, TLSSAN: literal, NodeIP: "2001:db8::3"}, nil)
+		}, []string{literal, "", literal, "server", "--server", server, "--tls-san", literal, "--node-ip", "2001:db8::3"}},
+		{"upgrade agent", func(c rootStreamer) error {
+			return Upgrade(c, AgentOpts{Version: literal, ServerURL: server, Token: literal, NodeIP: "2001:db8::2"}, nil)
+		}, []string{literal, server, literal, "agent", "--node-ip", "2001:db8::2"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var got []string
@@ -223,5 +234,60 @@ func TestKubeconfigAddresses(t *testing.T) {
 				t.Fatalf("got %q, %v", out, err)
 			}
 		})
+	}
+}
+
+func TestReadConfig(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		content *string
+	}{
+		{name: "missing"},
+		{name: "empty", content: new(string)},
+		{name: "content", content: func() *string { s := "present\ndisable: [traefik]\n"; return &s }()},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := t.TempDir() + "/config.yaml"
+			if tt.content != nil {
+				if err := os.WriteFile(path, []byte(*tt.content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Run the generated shell against a local file in place of
+			// the node's.
+			c := remoteStub{runRoot: func(cmd string) (string, error) {
+				out, err := exec.Command("sh", "-c", strings.ReplaceAll(cmd, configFilePath, path)).Output()
+				return string(out), err
+			}}
+			got, err := ReadConfig(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.content == nil {
+				if got != nil {
+					t.Fatalf("missing file read as %q", got)
+				}
+				return
+			}
+			if got == nil || string(got) != *tt.content {
+				t.Fatalf("got %q, want %q", got, *tt.content)
+			}
+		})
+	}
+}
+
+func TestRestart(t *testing.T) {
+	for installation, want := range map[Installation]string{
+		InstalledServer: "systemctl restart k3s;",
+		InstalledAgent:  "systemctl restart k3s-agent;",
+	} {
+		var ran string
+		c := remoteStub{runRoot: func(cmd string) (string, error) { ran = cmd; return "", nil }}
+		if err := Restart(c, installation); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(ran, want) {
+			t.Errorf("%s: ran %q, want %q", installation, ran, want)
+		}
 	}
 }
