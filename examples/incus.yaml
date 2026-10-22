@@ -1,0 +1,46 @@
+# Single managed VM. Enroll `quick8s` with `incus remote add` first.
+cluster:
+  name: development
+  ssh:
+    user: quick8s
+    # key: ~/.ssh/id_ed25519   # optional; SSH agent first
+    # The key authorized on the VM is publicKey, else key's .pub, else the
+    # one plain key in your SSH agent.
+    # publicKey: ~/.ssh/id_ed25519.pub
+  nodes:
+    controlPlane:
+      - name: servers        # the VM is named development-servers-001
+        count: 1
+        # For static networking, replace count with:
+        # addresses: [192.168.50.10/24]   # allocated to you, outside DHCP ranges
+        # gateway: 192.168.50.1
+        # nameservers: [192.168.50.1]
+        # searchDomains: [lab.example.com]
+        incus:               # overrides the top-level incus defaults
+          memory: 8GiB
+        cloudInit:           # native cloud-config; quick8s owns users, hostname and network
+          timezone: Europe/London
+          packages: [jq]
+          write_files:
+            - path: /etc/quick8s-example
+              permissions: "0644"
+              content: |
+                Provisioned by quick8s.
+        labels:
+          tier: control
+
+# Where managed machines come from, and their defaults. Select a network
+# reachable from this workstation (SSH and port 6443).
+incus:
+  remote: quick8s
+  project: default
+  image: images:debian/12/cloud
+  network: incusbr0
+  storagePool: local
+  cpus: 2
+  memory: 4GiB
+  disk: 20GiB
+
+k3s:
+  server:
+    disable: [traefik]

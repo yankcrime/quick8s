@@ -5,10 +5,14 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -17,16 +21,18 @@ import (
 	"testing"
 
 	"golang.org/x/crypto/ssh"
+
+	"quick8s/internal/node/nodetest"
 )
 
 // updateSSH simulates remote commands without running shell commands or K3s.
-func updateSSH(t *testing.T, run func(string, io.Reader) (string, error)) (int, string) {
+func updateSSH(t *testing.T, run func(string, io.Reader) (string, error)) int {
 	t.Helper()
-	t.Setenv("SSH_AUTH_SOCK", "")
 	_, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
+	nodetest.Agent(t, key)
 	signer, err := ssh.NewSignerFromKey(key)
 	if err != nil {
 		t.Fatal(err)
@@ -99,15 +105,75 @@ func updateSSH(t *testing.T, run func(string, io.Reader) (string, error)) (int, 
 		<-done
 		connections.Wait()
 	})
-	keyPath := filepath.Join(t.TempDir(), "key")
-	block, err := ssh.MarshalPrivateKey(key, "test")
+	return listener.Addr().(*net.TCPAddr).Port
+}
+
+// fakeNode answers the commands up uses to label and taint a node, keeping
+// what it's patched with so a later run sees its own changes.
+type fakeNode struct {
+	cert   string
+	object map[string]any
+	calls  int
+}
+
+func newFakeNode(t *testing.T, name string) *fakeNode {
+	t.Helper()
+	_, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(keyPath, pem.EncodeToMemory(block), 0o600); err != nil {
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "system:node:" + name}}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, key.Public(), key)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return listener.Addr().(*net.TCPAddr).Port, keyPath
+	return &fakeNode{
+		cert:   string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		object: map[string]any{"metadata": map[string]any{"name": name, "resourceVersion": "1"}},
+	}
+}
+
+func (n *fakeNode) handle(cmd string) (string, bool, error) {
+	if strings.Contains(cmd, "client-kubelet.crt") || strings.Contains(cmd, " get node ") || strings.Contains(cmd, " patch node ") {
+		n.calls++
+	}
+	switch {
+	case strings.Contains(cmd, "cat /var/lib/rancher/k3s/agent/client-kubelet.crt"):
+		return n.cert, true, nil
+	case strings.Contains(cmd, " get node "):
+		out, err := json.Marshal(n.object)
+		return string(out), true, err
+	case strings.Contains(cmd, " patch node "):
+		// The payload is shell-quoted inside the root wrapper; JSON without
+		// single quotes survives that intact, so decode the first value.
+		_, payload, _ := strings.Cut(cmd, " -p ")
+		var patch map[string]any
+		if err := json.NewDecoder(strings.NewReader(payload[strings.Index(payload, "{"):])).Decode(&patch); err != nil {
+			return "", true, err
+		}
+		mergePatch(n.object, patch)
+		return "", true, nil
+	}
+	return "", false, nil
+}
+
+// mergePatch applies a JSON merge patch (RFC 7386) in place.
+func mergePatch(dst, patch map[string]any) {
+	for k, v := range patch {
+		switch v := v.(type) {
+		case nil:
+			delete(dst, k)
+		case map[string]any:
+			child, ok := dst[k].(map[string]any)
+			if !ok {
+				child = map[string]any{}
+				dst[k] = child
+			}
+			mergePatch(child, v)
+		default:
+			dst[k] = v
+		}
+	}
 }
 
 func TestCommandsRetryPendingUpdates(t *testing.T) {
@@ -124,9 +190,13 @@ func TestCommandsRetryPendingUpdates(t *testing.T) {
 				attempts, readinessChecks := 0, 0
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
-				port, keyPath := updateSSH(t, func(cmd string, stdin io.Reader) (string, error) {
+				kube := newFakeNode(t, "test-node")
+				port := updateSSH(t, func(cmd string, stdin io.Reader) (string, error) {
 					mu.Lock()
 					defer mu.Unlock()
+					if out, ok, err := kube.handle(cmd); ok {
+						return out, err
+					}
 					switch {
 					case strings.Contains(cmd, "k3s-uninstall.sh"):
 						return "server\n", nil
@@ -197,7 +267,7 @@ func TestCommandsRetryPendingUpdates(t *testing.T) {
 					desired = old
 				}
 				specPath := filepath.Join(t.TempDir(), "quick8s.yaml")
-				spec := fmt.Sprintf("cluster:\n  kubernetesVersion: %s\n  ssh:\n    user: test\n    port: %d\n    key: %s\n  nodes:\n    controlPlane: [127.0.0.1]\nk3s:\n  server:\n    disable: [traefik]\n", desired, port, keyPath)
+				spec := fmt.Sprintf("cluster:\n  kubernetesVersion: %s\n  ssh:\n    user: test\n    port: %d\n  nodes:\n    controlPlane: [{name: servers, hosts: [127.0.0.1]}]\nk3s:\n  server:\n    disable: [traefik]\n", desired, port)
 				if err := os.WriteFile(specPath, []byte(spec), 0o600); err != nil {
 					t.Fatal(err)
 				}
@@ -209,7 +279,7 @@ func TestCommandsRetryPendingUpdates(t *testing.T) {
 					cmd.SetOut(io.Discard)
 					args := []string{"up", "-y", "-f", specPath}
 					if command == "upgrade" {
-						args = []string{"upgrade", "127.0.0.1", "-y", "--k3s-version", target, "--ssh-user", "test", "--ssh-port", fmt.Sprint(port), "--ssh-key", keyPath}
+						args = []string{"upgrade", "127.0.0.1", "-y", "--k3s-version", target, "--ssh-user", "test", "--ssh-port", fmt.Sprint(port)}
 					}
 					cmd.SetArgs(args)
 					err := cmd.Execute()
@@ -235,6 +305,10 @@ func TestCommandsRetryPendingUpdates(t *testing.T) {
 				if pending != nil || attempts != 2 || readinessChecks == 0 {
 					t.Fatalf("pending=%v, attempts=%d, readiness checks=%d", pending, attempts, readinessChecks)
 				}
+				// Without labels or taints, up never calls the Kubernetes API.
+				if kube.calls != 0 {
+					t.Fatalf("made %d Kubernetes API calls for a pool without labels or taints", kube.calls)
+				}
 			})
 		}
 	}
@@ -245,7 +319,7 @@ func TestReadinessFailureStopsRollout(t *testing.T) {
 	defer cancel()
 	var mu sync.Mutex
 	installs, checks := 0, 0
-	port, keyPath := updateSSH(t, func(cmd string, _ io.Reader) (string, error) {
+	port := updateSSH(t, func(cmd string, _ io.Reader) (string, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		switch {
@@ -274,7 +348,7 @@ func TestReadinessFailureStopsRollout(t *testing.T) {
 	cmd.SetContext(ctx)
 	cmd.SetErr(io.Discard)
 	cmd.SetOut(io.Discard)
-	cmd.SetArgs([]string{"upgrade", "--control-plane", "127.0.0.1,localhost", "-y", "--k3s-version", "v1.34.1+k3s1", "--ssh-user", "test", "--ssh-port", fmt.Sprint(port), "--ssh-key", keyPath})
+	cmd.SetArgs([]string{"upgrade", "--control-plane", "127.0.0.1,localhost", "-y", "--k3s-version", "v1.34.1+k3s1", "--ssh-user", "test", "--ssh-port", fmt.Sprint(port)})
 	if err := cmd.Execute(); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected rollout to fail on readiness, got %v", err)
 	}

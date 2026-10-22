@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"net"
 	"os"
@@ -18,11 +19,19 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+
+	"quick8s/internal/node/nodetest"
 )
 
 // testSSHServer executes commands only on localhost, with an optional fake
 // id/sudo PATH. The fixture never requires root or invokes the real sudo.
 func testSSHServer(t *testing.T, env []string, rejectAuth bool) Target {
+	t.Helper()
+	return testSSHServerAccepting(t, env, func(ssh.PublicKey) bool { return !rejectAuth })
+}
+
+// testSSHServerAccepting authenticates only the keys accept allows.
+func testSSHServerAccepting(t *testing.T, env []string, accept func(ssh.PublicKey) bool) Target {
 	t.Helper()
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -32,8 +41,8 @@ func testSSHServer(t *testing.T, env []string, rejectAuth bool) Target {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := &ssh.ServerConfig{PublicKeyCallback: func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
-		if rejectAuth {
+	config := &ssh.ServerConfig{PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+		if !accept(key) {
 			return nil, errors.New("key rejected")
 		}
 		return nil, nil
@@ -209,7 +218,7 @@ func TestRootOperations(t *testing.T) {
 }
 
 func TestDialClosesAgent(t *testing.T) {
-	for _, mode := range []string{"success", "key failure", "handshake failure"} {
+	for _, mode := range []string{"success", "handshake failure"} {
 		t.Run(mode, func(t *testing.T) {
 			// Keep the Unix socket path below the macOS sockaddr_un limit.
 			dir, err := os.MkdirTemp("", "q8s-agent-")
@@ -244,15 +253,15 @@ func TestDialClosesAgent(t *testing.T) {
 			}()
 			t.Setenv("SSH_AUTH_SOCK", socket)
 			target := testSSHServer(t, nil, mode == "handshake failure")
-			if mode == "key failure" {
-				target.KeyPath = filepath.Join(dir, "missing-key")
-			}
 			c, err := Dial(target)
 			if c != nil {
 				defer c.Close()
 			}
 			if (err == nil) != (mode == "success") {
 				t.Fatalf("unexpected dial result: %v", err)
+			}
+			if errors.Is(err, ErrAuth) != (mode == "handshake failure") {
+				t.Fatalf("only a rejected key should be ErrAuth: %v", err)
 			}
 			// Observe closure while the successful SSH connection is still open.
 			select {
@@ -302,5 +311,150 @@ func TestStreamAsRootDeliversOutputBeforeExit(t *testing.T) {
 	}
 	if w.out.String() != "first\nsecond\n" {
 		t.Fatalf("streamed %q", w.out.String())
+	}
+}
+
+// writeKey writes key as an OpenSSH private key file, encrypted when
+// passphrase isn't empty.
+func writeKey(t *testing.T, key ed25519.PrivateKey, passphrase string) string {
+	t.Helper()
+	var block *pem.Block
+	var err error
+	if passphrase == "" {
+		block, err = ssh.MarshalPrivateKey(key, "")
+	} else {
+		block, err = ssh.MarshalPrivateKeyWithPassphrase(key, "", []byte(passphrase))
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "id")
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func accepting(key ed25519.PrivateKey) func(ssh.PublicKey) bool {
+	want, _ := ssh.NewPublicKey(key.Public())
+	return func(got ssh.PublicKey) bool { return bytes.Equal(got.Marshal(), want.Marshal()) }
+}
+
+// The agent is preferred but optional: a key file alone is enough.
+func TestDialWithoutAgent(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+	// Nothing listens here: Dial must fail before touching the network.
+	_, err := Dial(Target{Host: "192.0.2.1", Port: 22, User: "test"})
+	if !errors.Is(err, ErrAuth) || !strings.Contains(err.Error(), "SSH_AUTH_SOCK") || !strings.Contains(err.Error(), "--ssh-key") {
+		t.Fatalf("expected ErrAuth naming both ways to authenticate, got %v", err)
+	}
+
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	keyPath := writeKey(t, key, "")
+	for name, sock := range map[string]string{"no agent": "", "unreachable agent": filepath.Join(t.TempDir(), "gone")} {
+		t.Setenv("SSH_AUTH_SOCK", sock)
+		target := testSSHServerAccepting(t, nil, accepting(key))
+		target.KeyPath = keyPath
+		c, err := Dial(target)
+		if err != nil {
+			t.Fatalf("%s: dial with key file: %v", name, err)
+		}
+		c.Close()
+	}
+}
+
+func TestDialUnlocksKeyFileOnlyWhenNeeded(t *testing.T) {
+	_, agentKey, _ := ed25519.GenerateKey(rand.Reader)
+	_, fileKey, _ := ed25519.GenerateKey(rand.Reader)
+	keyPath := writeKey(t, fileKey, "secret")
+	prompts, passphrase := 0, "secret"
+	original := readPassphrase
+	readPassphrase = func(string) ([]byte, error) { prompts++; return []byte(passphrase), nil }
+	t.Cleanup(func() {
+		readPassphrase = original
+		delete(unlocked, keyPath)
+	})
+	nodetest.Agent(t, agentKey)
+
+	// The agent's key is accepted: the encrypted key file is never unlocked.
+	target := testSSHServerAccepting(t, nil, accepting(agentKey))
+	target.KeyPath = keyPath
+	c, err := Dial(target)
+	if err != nil || prompts != 0 {
+		t.Fatalf("dial = %v, prompts = %d", err, prompts)
+	}
+	c.Close()
+
+	// A wrong passphrase fails as ErrAuth, so retrying callers stop.
+	passphrase = "wrong"
+	target = testSSHServerAccepting(t, nil, accepting(fileKey))
+	target.KeyPath = keyPath
+	if _, err := Dial(target); !errors.Is(err, ErrAuth) {
+		t.Fatalf("expected ErrAuth for a wrong passphrase, got %v", err)
+	}
+
+	// Only the file's key is accepted. It's still offered after the agent's
+	// keys fail, and unlocked once, however many connections use it.
+	passphrase, prompts = "secret", 0
+	for range 2 {
+		target := testSSHServerAccepting(t, nil, accepting(fileKey))
+		target.KeyPath = keyPath
+		c, err := Dial(target)
+		if err != nil {
+			t.Fatalf("dial with key file after agent: %v", err)
+		}
+		c.Close()
+	}
+	if prompts != 1 {
+		t.Fatalf("prompted %d times, want once", prompts)
+	}
+}
+
+func TestAgentKey(t *testing.T) {
+	newKey := func() (ed25519.PrivateKey, ssh.PublicKey) {
+		_, key, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pub, err := ssh.NewPublicKey(key.Public())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return key, pub
+	}
+	personal, personalPub := newKey()
+	other, _ := newKey()
+	// Teleport-style: a short-lived key loaded both plain and certified.
+	certified, certifiedPub := newKey()
+	caKey, _ := newKey()
+	ca, err := ssh.NewSignerFromKey(caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := &ssh.Certificate{Key: certifiedPub, CertType: ssh.UserCert, ValidBefore: ssh.CertTimeInfinity}
+	if err := cert.SignCert(rand.Reader, ca); err != nil {
+		t.Fatal(err)
+	}
+	line := func(pub ssh.PublicKey, comment string) string {
+		return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pub))) + " " + comment
+	}
+
+	nodetest.AgentWith(t,
+		agent.AddedKey{PrivateKey: personal, Comment: "me@laptop"},
+		agent.AddedKey{PrivateKey: certified, Comment: "teleport:key"},
+		agent.AddedKey{PrivateKey: certified, Certificate: cert, Comment: "teleport:cert"},
+	)
+	if got, err := AgentKey(); err != nil || got != line(personalPub, "me@laptop") {
+		t.Fatalf("AgentKey() = %q, %v", got, err)
+	}
+
+	nodetest.AgentWith(t, agent.AddedKey{PrivateKey: personal, Comment: "me@laptop"}, agent.AddedKey{PrivateKey: other, Comment: "work"})
+	if _, err := AgentKey(); err == nil || !strings.Contains(err.Error(), "me@laptop, work") {
+		t.Fatalf("expected an error naming both keys, got %v", err)
+	}
+
+	nodetest.AgentWith(t, agent.AddedKey{PrivateKey: certified, Certificate: cert})
+	if _, err := AgentKey(); err == nil || !strings.Contains(err.Error(), "no plain key") {
+		t.Fatalf("expected no candidates, got %v", err)
 	}
 }

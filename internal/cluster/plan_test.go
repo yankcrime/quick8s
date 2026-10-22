@@ -14,10 +14,10 @@ func TestPlan(t *testing.T) {
 		v134 = "v1.34.1+k3s1"
 	)
 	serverConfig := []byte("disable:\n    - traefik\n")
+	cp := func(host string) Node { return Node{Host: host, Config: serverConfig} }
 	spec := &Spec{
-		ControlPlanes: []Node{{"cp1"}, {"cp2"}, {"cp3"}},
-		Workers:       []Node{{"w1"}, {"w2"}},
-		ServerConfig:  serverConfig,
+		ControlPlanes: []Node{cp("cp1"), cp("cp2"), cp("cp3")},
+		Workers:       []Node{{Host: "w1"}, {Host: "w2"}},
 	}
 	at := func(version string) Spec {
 		s := *spec

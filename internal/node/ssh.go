@@ -2,6 +2,7 @@ package node
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
@@ -25,17 +26,23 @@ type Client struct {
 	conn *ssh.Client
 }
 
-// Dial connects to the given target over SSH, authenticating via the
-// running SSH agent by default, or an explicit private key if KeyPath is set.
+// ErrAuth marks a Dial failure that retrying won't fix, unlike an
+// unreachable or still-booting host: there are no keys to offer, a key
+// file can't be unlocked, or the server rejected every key offered.
+var ErrAuth = errors.New("SSH authentication failed")
+
+// Dial connects to the given target over SSH, authenticating with the
+// running SSH agent's keys first, then the private key at KeyPath, if set.
 func Dial(t Target) (*Client, error) {
 	// The agent is only needed during authentication. Dial owns its socket,
-	// including cleanup when key parsing or the SSH handshake fails.
-	var agentConn net.Conn
-	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
-		agentConn, _ = net.Dial("unix", sock)
-		if agentConn != nil {
-			defer agentConn.Close()
-		}
+	// including cleanup when key parsing or the SSH handshake fails. It's
+	// optional when a key file is given.
+	agentConn, agentErr := dialAgent()
+	if agentConn != nil {
+		defer agentConn.Close()
+	}
+	if agentConn == nil && t.KeyPath == "" {
+		return nil, fmt.Errorf("%w; or pass --ssh-key (cluster.ssh.key)", agentErr)
 	}
 	methods, err := authMethods(t.KeyPath, agentConn)
 	if err != nil {
@@ -55,8 +62,8 @@ func Dial(t Target) (*Client, error) {
 	conn, err := ssh.Dial("tcp", addr, cfg)
 	if err != nil {
 		if strings.Contains(err.Error(), "unable to authenticate") {
-			return nil, fmt.Errorf("dialing %s: %w\nhint: no offered key was accepted for %s@%s; run `ssh-add <key>` to load the right key into your agent (check what's loaded with `ssh-add -l`), or pass --ssh-key explicitly%s",
-				addr, err, t.User, t.Host, agentHint(agentConn != nil))
+			return nil, fmt.Errorf("dialing %s: %w: %w\nhint: no offered key was accepted for %s@%s; load the right one into your SSH agent with `ssh-add <key>` (check what's loaded with `ssh-add -l`), or pass --ssh-key",
+				addr, ErrAuth, err, t.User, t.Host)
 		}
 		return nil, fmt.Errorf("dialing %s: %w", addr, err)
 	}
@@ -64,11 +71,71 @@ func Dial(t Target) (*Client, error) {
 	return &Client{conn: conn}, nil
 }
 
-func agentHint(agentAvailable bool) string {
-	if agentAvailable {
-		return ""
+func dialAgent() (net.Conn, error) {
+	sock := os.Getenv("SSH_AUTH_SOCK")
+	if sock == "" {
+		return nil, fmt.Errorf("%w: no SSH agent is running (SSH_AUTH_SOCK is unset); start one and load your key with `ssh-add <key>`", ErrAuth)
 	}
-	return " (no running SSH agent was found; is SSH_AUTH_SOCK set?)"
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		return nil, fmt.Errorf("%w: connecting to the SSH agent at %s: %v", ErrAuth, sock, err)
+	}
+	return conn, nil
+}
+
+// AgentKey returns an authorized_keys line for the one plain key in the
+// running SSH agent, for authorizing on a new machine. Certificates are
+// skipped, and so are keys the agent also holds a certificate for, as
+// Teleport and similar tools load them: those are for certificate
+// authentication, not authorized_keys. Zero or several candidates is an
+// error naming them, since guessing would lock the user out.
+func AgentKey() (string, error) {
+	conn, err := dialAgent()
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	keys, err := agent.NewClient(conn).List()
+	if err != nil {
+		return "", fmt.Errorf("listing SSH agent keys: %w", err)
+	}
+	certified := map[string]bool{}
+	type plain struct {
+		key     ssh.PublicKey
+		comment string
+	}
+	var plains []plain
+	for _, k := range keys {
+		pub, err := ssh.ParsePublicKey(k.Blob)
+		if err != nil {
+			continue
+		}
+		if cert, ok := pub.(*ssh.Certificate); ok {
+			certified[string(cert.Key.Marshal())] = true
+			continue
+		}
+		plains = append(plains, plain{pub, k.Comment})
+	}
+	var candidates []plain
+	var names []string
+	for _, p := range plains {
+		if !certified[string(p.key.Marshal())] {
+			candidates = append(candidates, p)
+			names = append(names, cmp.Or(p.comment, ssh.FingerprintSHA256(p.key)))
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return "", errors.New("the SSH agent holds no plain key to authorize; load one with `ssh-add <key>`, or set cluster.ssh.publicKey")
+	case 1:
+		line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(candidates[0].key)))
+		if c := candidates[0].comment; c != "" {
+			line += " " + c
+		}
+		return line, nil
+	default:
+		return "", fmt.Errorf("the SSH agent holds several keys (%s); set cluster.ssh.publicKey to the one to authorize", strings.Join(names, ", "))
+	}
 }
 
 // Close closes the underlying SSH connection.
@@ -134,36 +201,55 @@ func (c *Client) WriteFileAsRoot(remotePath string, content []byte) error {
 	return nil
 }
 
-// authMethods builds the list of SSH auth methods to offer, preferring the
-// running SSH agent (so users don't need to point at a key file at all) and
-// adding an explicit private key on top when one is given.
+// authMethods offers the SSH agent's keys, then the private key at keyPath,
+// if given. Both go in one publickey method: x/crypto never tries a second
+// method of the same name once the first fails, so a separate method would
+// never offer the key file.
 func authMethods(keyPath string, agentConn net.Conn) ([]ssh.AuthMethod, error) {
-	var methods []ssh.AuthMethod
-	if agentConn != nil {
-		methods = append(methods, ssh.PublicKeysCallback(agent.NewClient(agentConn).Signers))
-	}
-
+	var key ssh.Signer
 	if keyPath != "" {
-		signer, err := loadPrivateKey(keyPath)
-		if err != nil {
+		var err error
+		if key, err = loadPrivateKey(keyPath); err != nil {
 			return nil, err
 		}
-		methods = append(methods, ssh.PublicKeys(signer))
 	}
-
-	if len(methods) == 0 {
-		return nil, errors.New("no SSH auth methods available: no running SSH agent found and no --ssh-key provided; run `ssh-add <key>` to load a key into your agent")
-	}
-
-	return methods, nil
+	return []ssh.AuthMethod{ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+		var signers []ssh.Signer
+		if agentConn != nil {
+			agentSigners, err := agent.NewClient(agentConn).Signers()
+			if err != nil && key == nil {
+				return nil, err
+			}
+			signers = agentSigners
+		}
+		if key != nil {
+			signers = append(signers, key)
+		}
+		return signers, nil
+	})}, nil
 }
 
-// loadPrivateKey reads and parses a private key file, prompting for a
-// passphrase on stderr if the key is encrypted.
+// unlocked caches decrypted keys by path, so a passphrase is asked for once
+// per run, however many nodes or connection attempts use the key.
+var unlocked = map[string]ssh.Signer{}
+
+// readPassphrase prompts on stderr; tests replace it.
+var readPassphrase = func(path string) ([]byte, error) {
+	fmt.Fprintf(os.Stderr, "Enter passphrase for %s: ", path)
+	passphrase, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stderr)
+	return passphrase, err
+}
+
+// loadPrivateKey reads and parses a private key file. An encrypted key in
+// OpenSSH's format stores its public half in the clear, so its passphrase
+// is only asked for if a server accepts that public key, which never
+// happens when the agent already holds the key. Other encrypted keys are
+// unlocked straight away.
 func loadPrivateKey(path string) (ssh.Signer, error) {
 	key, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("reading private key %s: %w", path, err)
+		return nil, fmt.Errorf("%w: reading private key %s: %v", ErrAuth, path, err)
 	}
 
 	signer, err := ssh.ParsePrivateKey(key)
@@ -173,19 +259,59 @@ func loadPrivateKey(path string) (ssh.Signer, error) {
 
 	var passphraseErr *ssh.PassphraseMissingError
 	if !errors.As(err, &passphraseErr) {
-		return nil, fmt.Errorf("parsing private key %s: %w", path, err)
+		return nil, fmt.Errorf("%w: parsing private key %s: %v", ErrAuth, path, err)
 	}
+	locked := &lockedKey{path: path, pem: key}
+	if passphraseErr.PublicKey == nil {
+		return locked.unlock()
+	}
+	locked.pub = passphraseErr.PublicKey
+	return locked, nil
+}
 
-	fmt.Fprintf(os.Stderr, "Enter passphrase for %s: ", path)
-	passphrase, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Fprintln(os.Stderr)
-	if err != nil {
-		return nil, fmt.Errorf("reading passphrase: %w", err)
-	}
+// lockedKey is an encrypted private key, unlocked on first use.
+type lockedKey struct {
+	path string
+	pem  []byte
+	pub  ssh.PublicKey
+}
 
-	signer, err = ssh.ParsePrivateKeyWithPassphrase(key, passphrase)
+func (k *lockedKey) PublicKey() ssh.PublicKey { return k.pub }
+
+func (k *lockedKey) Sign(rand io.Reader, data []byte) (*ssh.Signature, error) {
+	signer, err := k.unlock()
 	if err != nil {
-		return nil, fmt.Errorf("parsing private key %s: %w", path, err)
+		return nil, err
 	}
+	return signer.Sign(rand, data)
+}
+
+func (k *lockedKey) SignWithAlgorithm(rand io.Reader, data []byte, algorithm string) (*ssh.Signature, error) {
+	signer, err := k.unlock()
+	if err != nil {
+		return nil, err
+	}
+	as, ok := signer.(ssh.AlgorithmSigner)
+	if !ok {
+		return nil, fmt.Errorf("%w: private key %s can't sign with %s", ErrAuth, k.path, algorithm)
+	}
+	return as.SignWithAlgorithm(rand, data, algorithm)
+}
+
+// unlock failures are ErrAuth, so callers that retry don't prompt again
+// until their deadline (or forever, with no terminal to prompt on).
+func (k *lockedKey) unlock() (ssh.Signer, error) {
+	if signer, ok := unlocked[k.path]; ok {
+		return signer, nil
+	}
+	passphrase, err := readPassphrase(k.path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: reading passphrase for %s: %v", ErrAuth, k.path, err)
+	}
+	signer, err := ssh.ParsePrivateKeyWithPassphrase(k.pem, passphrase)
+	if err != nil {
+		return nil, fmt.Errorf("%w: unlocking private key %s: %v", ErrAuth, k.path, err)
+	}
+	unlocked[k.path] = signer
 	return signer, nil
 }

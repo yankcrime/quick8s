@@ -48,8 +48,8 @@ type Update struct {
 	// From and To are the installed and target K3s releases when the
 	// installer must run, and empty otherwise. They can match on a retry.
 	From, To string
-	// Config means the node's K3s config file doesn't match its role's
-	// section of the spec, and is replaced by it - or removed, when the
+	// Config means the node's K3s config file doesn't match the spec's
+	// config for that node, and is replaced by it - or removed, when the
 	// spec has none.
 	Config bool
 	// Restart retries an interrupted update even when the files match.
@@ -78,7 +78,7 @@ func (s *Spec) Plan(nodes map[string]NodeState) (Plan, error) {
 			if p.Server == "" {
 				p.Server = n.Host
 			}
-			u, err := s.update(n.Host, true, state)
+			u, err := s.update(n, true, state)
 			if err != nil {
 				return Plan{}, err
 			}
@@ -100,7 +100,7 @@ func (s *Spec) Plan(nodes map[string]NodeState) (Plan, error) {
 	for _, n := range s.Workers {
 		switch state := nodes[n.Host]; state.Installation {
 		case k3s.InstalledAgent:
-			u, err := s.update(n.Host, false, state)
+			u, err := s.update(n, false, state)
 			if err != nil {
 				return Plan{}, err
 			}
@@ -118,7 +118,8 @@ func (s *Spec) Plan(nodes map[string]NodeState) (Plan, error) {
 
 // update works out how a node already running K3s differs from the spec,
 // returning nil if it doesn't.
-func (s *Spec) update(host string, controlPlane bool, state NodeState) (*Update, error) {
+func (s *Spec) update(n Node, controlPlane bool, state NodeState) (*Update, error) {
+	host := n.Host
 	u := Update{Host: host, ControlPlane: controlPlane}
 	to := s.KubernetesVersion
 	if state.Pending != nil {
@@ -136,7 +137,7 @@ func (s *Spec) update(host string, controlPlane bool, state NodeState) (*Update,
 			u.From, u.To = state.Version, to
 		}
 	}
-	u.Config = !sameConfig(s.Config(controlPlane), state.Config)
+	u.Config = !sameConfig(n.Config, state.Config)
 	if !u.Upgrade() && !u.Config && !u.Restart {
 		return nil, nil
 	}
@@ -155,6 +156,16 @@ func sameConfig(a, b []byte) bool {
 		return false
 	}
 	return reflect.DeepEqual(av, bv)
+}
+
+// Node returns the node at host, or false if the spec doesn't list it.
+func (s *Spec) Node(host string) (Node, bool) {
+	for _, n := range s.Nodes() {
+		if n.Host == host {
+			return n, true
+		}
+	}
+	return Node{}, false
 }
 
 // Nodes returns every node, control planes first.

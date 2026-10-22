@@ -2,11 +2,8 @@ package k3s
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
-	"strings"
 	"time"
 
 	"quick8s/internal/shell"
@@ -66,27 +63,13 @@ func checkReady(c rootRunner, installation Installation, version string) error {
 		}
 		return nil
 	case InstalledAgent:
-		// The certificate identifies the actual Kubernetes node name,
-		// including --node-name and --with-node-id overrides.
-		out, err := c.RunAsRoot("cat " + kubeletCertPath)
+		name, err := NodeName(c)
 		if err != nil {
 			return err
 		}
-		block, _ := pem.Decode([]byte(out))
-		if block == nil {
-			return fmt.Errorf("reading kubelet client certificate: no PEM certificate")
-		}
-		cert, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			return fmt.Errorf("reading kubelet client certificate: %w", err)
-		}
-		name, ok := strings.CutPrefix(cert.Subject.CommonName, "system:node:")
-		if !ok || name == "" {
-			return fmt.Errorf("unexpected kubelet identity %q", cert.Subject.CommonName)
-		}
 		// Kubernetes can retain an old Ready condition for a stopped node.
 		// Require the local kubelet to answer as well as checking its status.
-		out, err = c.RunAsRoot("curl -fsS --max-time 5 http://127.0.0.1:10248/healthz >/dev/null && " +
+		out, err := c.RunAsRoot("curl -fsS --max-time 5 http://127.0.0.1:10248/healthz >/dev/null && " +
 			binaryPath + " kubectl --kubeconfig " + kubeletConfigPath + " --request-timeout=5s get node " + shell.Quote(name) + " -o json")
 		if err != nil {
 			return err
