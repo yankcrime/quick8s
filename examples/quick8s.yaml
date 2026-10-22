@@ -6,23 +6,41 @@ cluster:
   # and run `quick8s up` to upgrade, one minor version at a time.
   kubernetesVersion: v1.33.4+k3s1
 
-  # Optional. Authentication always tries the running SSH agent first; key is
-  # an extra fallback. user defaults to your local username, port to 22.
+  # Optional. Authentication tries the running SSH agent first; key is an
+  # optional extra, needed only without an agent. user defaults to your
+  # local username, port to 22.
   ssh:
     user: ubuntu
     # key: ~/.ssh/id_ed25519
 
-  # Nodes, by hostname or IP.
+  # Nodes, in named pools. A pool of existing machines lists them by
+  # hostname or IP under hosts; see incus.yaml for pools quick8s creates.
   nodes:
     # K3s server nodes. The first one initializes the cluster; with more than
     # one, they form an HA control plane on embedded etcd - use an odd number.
     controlPlane:
-      - 192.168.1.10
-      - 192.168.1.11
-      - 192.168.1.12
+      - name: servers
+        hosts:
+          - 192.168.1.10
+          - 192.168.1.11
+          - 192.168.1.12
     worker:
-      - 192.168.1.20
-      - 192.168.1.21
+      - name: general
+        hosts: [192.168.1.20, 192.168.1.21]
+        # Optional. Set through the Kubernetes API and kept in sync on every
+        # `up`, with no restart. Pools without labels or taints are left alone.
+        labels:
+          node-role.kubernetes.io/worker: "true"
+          tier: general
+      - name: gpu
+        hosts: [192.168.1.30]
+        labels:
+          accelerator: nvidia
+        taints:
+          - nvidia.com/gpu=true:NoSchedule
+        # Merged over k3s.agent for this pool's nodes only.
+        k3s:
+          kubelet-arg: [max-pods=50]
 
 # K3s's own configuration (https://docs.k3s.io/installation/configuration#configuration-file),
 # written to /etc/rancher/k3s/config.yaml before K3s first starts. Keys are
@@ -37,5 +55,4 @@ k3s:
       - k8s.example.com
   # For worker (agent) nodes.
   agent:
-    node-label:
-      - tier=general
+    kubelet-arg: [max-pods=110]

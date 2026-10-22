@@ -26,15 +26,35 @@ print status to stderr / payload to stdout. Business logic belongs in
 
 ## SSH conventions
 
-- **Auth is agent-first, always.** `node.Dial` tries the running SSH agent
-  unconditionally; `--ssh-key` is an explicit fallback on top, not a
-  replacement. Don't make `--ssh-key` required for anything.
+- **Auth is agent-first; a key file is optional.** `node.Dial` offers the
+  running SSH agent's keys, then `--ssh-key`/`cluster.ssh.key` if given.
+  Neither is required on its own, but one must be there: no agent and no
+  key, an unreadable key, or no key the server accepts is `node.ErrAuth`,
+  which callers that retry (`dialGuest`) treat as final. Don't make
+  `--ssh-key` required for anything. Both go in **one** `publickey` auth
+  method: x/crypto marks a method name as tried after it fails and never
+  runs a second method of the same name, so a separate key-file method
+  was silently never offered whenever an agent was running.
+- **A passphrase is asked for only when needed.** An encrypted OpenSSH
+  key keeps its public half unencrypted, so `lockedKey` offers it and
+  prompts (stderr, via `golang.org/x/term`) only if the server accepts
+  it; a key the agent already holds never prompts. Unlocked keys are
+  cached by path for the run, so retries and multiple nodes prompt at
+  most once, and an unlock failure is `ErrAuth`, so a retry loop can't
+  keep prompting. Prompting needs a real TTY on stdin and fails with
+  `operation not supported by device` in a non-interactive shell -
+  expected, not a bug; load the key into an agent there instead.
+- **The key authorized on a managed VM** is `cluster.ssh.publicKey`, else
+  `cluster.ssh.key`'s `.pub` (so the VM doesn't depend on the agent's
+  contents), else `node.AgentKey`: the agent's one plain key, skipping
+  certificates and keys the agent also holds a certificate for (Teleport
+  loads its key both ways). Zero or several candidates is an error, never
+  a guess. The agent lookup runs in `lifecycle` (`desired`), not at load,
+  to keep `internal/cluster` free of SSH, and `down` never needs it. Its
+  line matches the `.pub` file (agent comment included), so switching
+  between them doesn't look like cloud-init drift.
 - **`--ssh-user` defaults to the local OS username** (`os/user.Current()`),
   mirroring `ssh(1)` — never default to `root`.
-- A passphrase-protected `--ssh-key` prompts interactively on stderr via
-  `golang.org/x/term`. This requires a real TTY on stdin — it will fail with
-  `operation not supported by device` when run from a non-interactive
-  sandbox/CI shell. That's expected, not a bug to fix.
 - Host key checking is intentionally `InsecureIgnoreHostKey()` (see TODO in
   `internal/node/ssh.go`) — acceptable for bootstrapping fresh nodes, flagged
   as a known gap rather than silently accepted.
@@ -87,15 +107,25 @@ Payload writes return their errors. Cobra has `SilenceErrors` enabled so
 ## Declarative `up`/`down` from `quick8s.yaml`
 
 `up`/`down` read a cluster definition (`quick8s.yaml` in cwd, or `-f`),
-Terraform-style. Two top-level keys, a deliberate shape: `cluster:` holds
-the version, SSH settings, and nodes as plain address lists under
-`cluster.nodes.controlPlane` and `cluster.nodes.worker` (both singular);
-`k3s:` holds K3s's own config, kept apart from quick8s's settings. `internal/cluster` owns the file format and is pure (no
-SSH): `Load` validates strictly (`KnownFields`, so typos fail loudly), and
-`Spec.Plan` turns per-node install state into what to do. Keep the
-planning logic there and table-tested; `internal/cli/up.go` just gathers
-state, runs the plan, and reuses the same `initControlPlane`/
-`addControlPlane`/`addWorker` helpers as `bootstrap`.
+Terraform-style. Three top-level keys, one per system, a deliberate shape:
+`cluster:` holds quick8s's settings (name, version, SSH) and node pools
+under `cluster.nodes.controlPlane` and `cluster.nodes.worker` (both
+singular, the role is the key, not a field); `incus:` holds the Incus
+connection and machine defaults; `k3s:` holds K3s's own config, kept apart
+from quick8s's settings. Every entry under a role is a named pool: either
+existing machines (`hosts:`) or managed ones (`count:` for DHCP, or
+`addresses:` with `gateway`/`nameservers`), never both. A managed pool's
+`incus:` overrides the top-level one field by field (`Incus.over`) — this
+replaced an earlier named `providers:` map, a `type:` key, and `members:`
+lists, which added indirection without adding anything the MVP accepted.
+Errors name the YAML path (`cluster.nodes.worker[1].taints[0]`).
+`internal/cluster` owns the file format and is pure (no SSH; the one file
+it reads is the managed SSH public key, at load time): `Load` validates
+strictly (`KnownFields`, so typos fail loudly), and `Spec.Plan` turns
+per-node install state into what to do. Keep the planning logic there and
+table-tested; `internal/cli/up.go` just gathers state, runs the plan, and
+reuses the same `initControlPlane`/`addControlPlane`/`addWorker` helpers
+as `bootstrap`.
 
 Decisions worth preserving:
 
@@ -119,12 +149,14 @@ Decisions worth preserving:
   problem mid-rollout.
 - **Config drift is compared semantically** (`sameConfig`: YAML-decoded
   and deep-compared), not byte-for-byte, so comment or formatting edits in
-  `quick8s.yaml` don't trigger a rolling restart. A missing `k3s.server`/
-  `k3s.agent` section means the nodes shouldn't have a config file, so it
-  gets removed.
+  `quick8s.yaml` don't trigger a rolling restart. Each `Node` carries its
+  own `Config`: the role's `k3s.server`/`k3s.agent` with the pool's `k3s:`
+  merged over it (top-level keys replaced in place, new keys appended).
+  When both are missing the node shouldn't have a config file, so it gets
+  removed.
 - **Probe everything before mutating anything.** `up` dials every node and
   detects its state first, holding the connections open for the install
-  phase (one dial per node, so one passphrase prompt per node).
+  phase (one dial per node).
 - **The join target is the first control plane that's already a server**,
   not blindly the first listed — otherwise reordering the file, or listing
   a new node first, would initialize a second cluster.
@@ -136,6 +168,31 @@ Decisions worth preserving:
 - **Adding a control plane to a sqlite (single-server) cluster is refused
   up front** (`k3s.EmbeddedEtcd`) rather than letting the join hang in
   systemd. The escape hatch is `cluster-init: true` under `k3s.server`.
+- **Pool `labels`/`taints` go through the Kubernetes API, not K3s
+  config** — the one deliberate exception to "don't mirror K3s". K3s's
+  `node-label`/`node-taint` only apply when a node first registers (so
+  `up` would report success while the node kept stale labels), and the
+  kubelet refuses most `kubernetes.io` labels. It's **opt-in per pool**:
+  `Node.Metadata` is nil unless the pool has a `labels` or `taints` key
+  (even empty, so `labels: {}` still clears what quick8s set), and nil
+  means no API calls at all. That keeps the simplest `up` on existing
+  hosts exactly as it was before pools existed: SSH and K3s only, nothing
+  that can fail on a custom `data-dir` or an unreachable API, and no
+  labels nobody asked for. `k3s.ApplyNodeMetadata` runs after joins on
+  every `up` for those nodes, via `k3s kubectl` on the join target, with
+  no restart and so no confirmation. It finds each node's name from
+  its kubelet certificate (`k3s.NodeName`, shared with readiness), and
+  patches with `resourceVersion` so concurrent edits conflict rather than
+  get clobbered. K3s's controllers keep updating a newly registered node,
+  so a `(Conflict)` is retried (re-read, recompute) a few times; other
+  errors aren't. Ownership is tracked in the `quick8s.io/managed-labels`/
+  `-taints` annotations, like `kubectl apply`'s last-applied: keys quick8s
+  set and the file dropped are removed; anything else is left alone.
+  There's deliberately no automatic pool label (one existed briefly and
+  was dropped to keep labels opt-in); `quick8s.io/` stays reserved, so one
+  can be added later, e.g. as a cluster-side record once pools shrink.
+- **Managed control planes always start on embedded etcd**, since growing
+  a pool should only mean changing a number.
 - **`k3s.server`/`k3s.agent` are opaque** `yaml.Node`s re-encoded as-is
   (key order and styles kept) and pushed like `--config-file` — the same
   "don't mirror K3s" philosophy as below. Don't add typed K3s fields.
@@ -288,7 +345,7 @@ executing silently.
 ## Testing: `hack/e2e-test.sh`
 
 Real lifecycle test against a real, disposable VM (colima on macOS) — not
-mocks. Two things worth knowing before touching it:
+mocks. Things worth knowing before touching it:
 
 1. **`--network-mode bridged` is required**, not optional. colima's default
    "shared" mode gives each VM profile an address that *looks* like it's on
@@ -311,6 +368,11 @@ mocks. Two things worth knowing before touching it:
    `hack/e2e-test.sh` and `make e2e-clean` pass `-d`; if you ever run
    `colima delete`/`colima start` by hand for a quick8s test profile, do the
    same, or the VM isn't actually fresh no matter what `colima list` claims.
+
+4. **The harness starts its own `ssh-agent`** holding colima's key (killed
+   in `cleanup`), so it exercises the preferred agent path without adding
+   throwaway VM keys to the caller's agent. The `--ssh-key` path is
+   covered by `internal/node`'s tests.
 
 If you extend the harness to cover multi-node scenarios, see the next
 section first.

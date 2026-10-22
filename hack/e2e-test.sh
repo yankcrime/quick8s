@@ -26,6 +26,7 @@ log() { echo "==> $*" >&2; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 cleanup() {
+  [ -n "${SSH_AGENT_PID:-}" ] && kill "$SSH_AGENT_PID" 2>/dev/null
   if [ -n "${KEEP_VM:-}" ]; then
     log "KEEP_VM set, leaving colima profile '$PROFILE' running"
     return
@@ -67,6 +68,11 @@ SSH_KEY="$(awk '/^  IdentityFile /{print $2}' <<<"$SSH_CONFIG" | tr -d '"')"
 [ -n "$SSH_USER" ] && [ -n "$SSH_KEY" ] || fail "could not parse SSH user/key from 'colima ssh-config'"
 log "SSH: $SSH_USER@$IP (key: $SSH_KEY)"
 
+# quick8s only authenticates through an SSH agent. Use a throwaway one
+# holding colima's key, rather than adding it to the caller's agent.
+eval "$(ssh-agent -s)" >/dev/null
+ssh-add -q "$SSH_KEY" || fail "could not add $SSH_KEY to the test SSH agent"
+
 log "Waiting for SSH on the VM's real network address..."
 for i in $(seq 1 30); do
   if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=2 \
@@ -96,13 +102,13 @@ expect_version() {
 }
 
 log "Running: quick8s bootstrap $IP --k3s-version $OLD_VERSION"
-KUBECONFIG_OUT="$("$QUICK8S" bootstrap "$IP" --ssh-user "$SSH_USER" --ssh-key "$SSH_KEY" --k3s-version "$OLD_VERSION")"
+KUBECONFIG_OUT="$("$QUICK8S" bootstrap "$IP" --ssh-user "$SSH_USER" --k3s-version "$OLD_VERSION")"
 grep -q "apiVersion: v1" <<<"$KUBECONFIG_OUT" || fail "bootstrap did not print a valid-looking kubeconfig"
 expect_version "$OLD_VERSION"
 log "bootstrap OK, kubeconfig looks valid"
 
 log "Running: quick8s upgrade to an older release (should be refused)"
-if DOWNGRADE_ERR="$("$QUICK8S" upgrade "$IP" --ssh-user "$SSH_USER" --ssh-key "$SSH_KEY" --k3s-version v1.35.9+k3s1 -y 2>&1)"; then
+if DOWNGRADE_ERR="$("$QUICK8S" upgrade "$IP" --ssh-user "$SSH_USER" --k3s-version v1.35.9+k3s1 -y 2>&1)"; then
   fail "upgrade allowed a downgrade"
 fi
 grep -q "doesn't support downgrades" <<<"$DOWNGRADE_ERR" || fail "unexpected downgrade error: $DOWNGRADE_ERR"
@@ -110,27 +116,27 @@ expect_version "$OLD_VERSION"
 log "downgrade refused, node untouched"
 
 log "Running: quick8s upgrade $IP --k3s-version $NEW_VERSION"
-"$QUICK8S" upgrade "$IP" --ssh-user "$SSH_USER" --ssh-key "$SSH_KEY" --k3s-version "$NEW_VERSION" -y
+"$QUICK8S" upgrade "$IP" --ssh-user "$SSH_USER" --k3s-version "$NEW_VERSION" -y
 expect_version "$NEW_VERSION"
 remote sudo cat /etc/systemd/system/k3s.service | grep -q -- "--tls-san" || fail "upgrade dropped the node's install arguments"
 log "upgrade OK"
 
 log "Running: quick8s upgrade again (should be a no-op)"
-UPGRADE_AGAIN_ERR="$("$QUICK8S" upgrade "$IP" --ssh-user "$SSH_USER" --ssh-key "$SSH_KEY" --k3s-version "$NEW_VERSION" 2>&1)"
+UPGRADE_AGAIN_ERR="$("$QUICK8S" upgrade "$IP" --ssh-user "$SSH_USER" --k3s-version "$NEW_VERSION" 2>&1)"
 grep -q "nothing to do" <<<"$UPGRADE_AGAIN_ERR" || fail "second upgrade was not a no-op: $UPGRADE_AGAIN_ERR"
 log "second upgrade OK, nothing to do"
 
 log "Running: quick8s kubeconfig $IP"
-KUBECONFIG_OUT2="$("$QUICK8S" kubeconfig "$IP" --ssh-user "$SSH_USER" --ssh-key "$SSH_KEY")"
+KUBECONFIG_OUT2="$("$QUICK8S" kubeconfig "$IP" --ssh-user "$SSH_USER")"
 grep -q "apiVersion: v1" <<<"$KUBECONFIG_OUT2" || fail "kubeconfig command did not print a valid-looking kubeconfig"
 log "kubeconfig OK"
 
 log "Running: quick8s teardown $IP"
-"$QUICK8S" teardown "$IP" --ssh-user "$SSH_USER" --ssh-key "$SSH_KEY" -y
+"$QUICK8S" teardown "$IP" --ssh-user "$SSH_USER" -y
 log "teardown OK"
 
 log "Verifying K3s is actually gone..."
-if "$QUICK8S" kubeconfig "$IP" --ssh-user "$SSH_USER" --ssh-key "$SSH_KEY" >/dev/null 2>&1; then
+if "$QUICK8S" kubeconfig "$IP" --ssh-user "$SSH_USER" >/dev/null 2>&1; then
   fail "kubeconfig still fetchable after teardown"
 fi
 log "confirmed: K3s is gone"
@@ -143,10 +149,10 @@ cluster:
   kubernetesVersion: $1
   ssh:
     user: $SSH_USER
-    key: $SSH_KEY
   nodes:
     controlPlane:
-      - $IP
+      - name: servers
+        hosts: [$IP]
 k3s:
   server:
     write-kubeconfig-mode: "${3:-0600}"
@@ -212,7 +218,7 @@ log "config-only restart recovered, runtime config applied, and subsequent up is
 
 log "Running: quick8s down -y"
 (cd "$CLUSTER_DIR" && "$QUICK8S" down -y)
-if "$QUICK8S" kubeconfig "$IP" --ssh-user "$SSH_USER" --ssh-key "$SSH_KEY" >/dev/null 2>&1; then
+if "$QUICK8S" kubeconfig "$IP" --ssh-user "$SSH_USER" >/dev/null 2>&1; then
   fail "kubeconfig still fetchable after down"
 fi
 log "down OK, K3s is gone"

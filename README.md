@@ -8,7 +8,8 @@ Early scaffold. Current scope: bootstrapping a K3s control plane on a remote
 host identified by hostname or IP, optionally forming an HA (multi-node)
 control plane and/or joining worker nodes to it, and upgrading it later —
 either imperatively with `bootstrap`/`upgrade`, or declaratively from a
-`quick8s.yaml` with `up`/`down`.
+`quick8s.yaml` with `up`/`down`. The infrastructure-provider MVP can also
+provision a single Incus VM before bootstrapping K3s.
 
 ## Declarative clusters: `quick8s.yaml`, `up` and `down`
 
@@ -20,23 +21,37 @@ cluster:
   kubernetesVersion: v1.33.4+k3s1   # K3s release; omit for latest stable, change to upgrade
 
   ssh:                              # optional; same defaults as the --ssh-* flags
-    user: ubuntu
-    # key: ~/.ssh/id_ed25519        # relative paths are relative to this file
+    user: ubuntu                    # keys come from your SSH agent
+    # key: ~/.ssh/id_ed25519        # optional, offered after the agent's keys
 
-  nodes:                            # hostnames or IPs
-    controlPlane:                   # the first one initializes the cluster
-      - 192.168.1.10
-      - 192.168.1.11
-      - 192.168.1.12
+  nodes:                            # named pools, per role
+    controlPlane:                   # the first node initializes the cluster
+      - name: servers
+        hosts: [192.168.1.10, 192.168.1.11, 192.168.1.12]
     worker:
-      - 192.168.1.20
+      - name: general
+        hosts: [192.168.1.20, 192.168.1.21]
+        labels: {tier: general}     # set via the Kubernetes API, kept in sync
+      - name: gpu
+        hosts: [192.168.1.30]
+        taints: [nvidia.com/gpu=true:NoSchedule]
+        k3s:                        # merged over k3s.agent for this pool only
+          kubelet-arg: [max-pods=50]
 
 k3s:                                # K3s's own config.yaml, passed through as-is
   server:                           # -> /etc/rancher/k3s/config.yaml on control planes
     disable: [traefik]
   agent:                            # -> /etc/rancher/k3s/config.yaml on workers
-    node-label: [tier=general]
+    kubelet-arg: [max-pods=110]
 ```
+
+The file has one top-level key per system: `cluster` for quick8s's own
+settings and node pools, `incus` for where managed machines come from (see
+[Provisioning an Incus VM](#provisioning-an-incus-vm)), and `k3s` for K3s's
+own configuration. Each pool is either existing machines, listed by address
+under `hosts`, or machines quick8s creates (`count` or `addresses`). Pool
+names are unique across the file; errors name the offending path, e.g.
+`cluster.nodes.worker[1].taints[0]`.
 
 ```
 quick8s up > kubeconfig.yaml      # create the cluster, or bring it in line with the file
@@ -56,8 +71,8 @@ match the file:
   the others join it. So adding a node to the file and running `up` again
   joins just that node.
 - **Existing nodes** are upgraded when `kubernetesVersion` changes, and get
-  their K3s config replaced (and K3s restarted) when the `k3s` section for
-  their role changes. Config is compared by content, so reformatting or
+  their K3s config replaced (and K3s restarted) when their K3s config - the
+  role's `k3s` section with the pool's `k3s` merged over it - changes. Config is compared by content, so reformatting or
   editing comments in `quick8s.yaml` doesn't restart anything; removing a
   section removes the node's config file.
 
@@ -73,12 +88,26 @@ from v1.33 to v1.35, set a v1.34 release, run `up`, then set v1.35). Without
 `kubernetesVersion`, `up` never upgrades, and new nodes install whatever
 version the cluster already runs. Nodes already matching the file are left
 alone, so `up` is safe to re-run, including after an interrupted upgrade.
-There's no local state file: the nodes themselves are the state. Before an
+For existing address-based clusters, there's no local state file: the nodes
+themselves are the state. Before an
 update, quick8s writes a small pending marker on that node, and removes it
 only after the running service passes readiness checks at the expected
 version. A failed or interrupted update is therefore retried even when its
 binary or config file already matches. Removing `kubernetesVersion` still
 allows an already-pending upgrade to finish.
+
+Pool `labels` and `taints` (`key[=value]:Effect`) are optional. When a
+pool declares them, they're applied through the Kubernetes API after
+nodes join, and converged on every `up` without restarting anything.
+K3s's own `node-label`/`node-taint` only take effect when a node first
+registers, and the kubelet refuses most `kubernetes.io` labels such as
+`node-role.kubernetes.io/worker`; the API has neither limitation. quick8s
+records the keys it set in `quick8s.io/managed-labels`/`-taints`
+annotations, so removing one from the file removes it from the node, while
+labels and taints set by anything else are left alone. Pools that declare
+neither are left alone entirely, and `up` makes no API calls for them; to
+clear everything quick8s set on a pool, leave `labels: {}` in place for
+one run before removing the key.
 
 Readiness checks run after both upgrades and config restarts, including on
 OpenRC: control planes must answer the API readiness endpoint at the target
@@ -95,9 +124,10 @@ What `up` deliberately doesn't do (yet):
   place and running containers keep running, but pods may briefly lose the
   node's API access while it restarts.
 - **Grow a single-server cluster into HA.** A cluster created with one
-  control plane uses sqlite, which other servers can't join; `up` refuses
-  with an explanation. If you expect to add control planes later, set
-  `cluster-init: true` under `k3s.server` when first creating it.
+  existing control plane uses sqlite, which other servers can't join; `up`
+  refuses with an explanation. If you expect to add control planes later,
+  set `cluster-init: true` under `k3s.server` when first creating it.
+  Managed control planes always start on embedded etcd.
 
 Some K3s settings (e.g. `cluster-cidr`) can't change once a cluster
 exists; quick8s doesn't know which, and K3s will refuse to start with them
@@ -110,9 +140,97 @@ re-run.
 
 ## Usage
 
-quick8s authenticates via your running SSH agent by default — no key path
-needed, as long as the right key is loaded (`ssh-add -l` to check,
-`ssh-add ~/.ssh/id_ed25519` to load one). `--ssh-user` defaults to your
+### Provisioning an Incus VM
+
+The provider MVP provisions one VM and then runs the existing SSH/K3s
+lifecycle against it. It uses the upstream Incus Go client directly, reusing
+the certificates and server trust from a configured Incus remote; the Incus
+CLI is needed for enrollment, not when running quick8s.
+
+Start with [`examples/incus.yaml`](examples/incus.yaml), changing the remote,
+network, storage pool, and SSH key path for your environment. The top-level
+`incus` block holds the connection to a configured Incus remote and machine
+defaults (`image`, `cpus`, `memory`, `disk`, `network`, `storagePool`); a
+managed pool's own `incus` block overrides any of them, including `remote`.
+
+```sh
+quick8s plan -f examples/incus.yaml
+quick8s up -f examples/incus.yaml > kubeconfig.yaml
+KUBECONFIG=kubeconfig.yaml kubectl get nodes
+quick8s down -f examples/incus.yaml
+```
+
+The project, network, and storage pool must already exist. The selected image
+must support cloud-init, the modern `cloud-init.*` Incus options, and the
+Incus guest agent. The example uses Debian's cloud VM image. The runner must
+reach the guest's SSH port and Kubernetes port 6443; access to the Incus API
+alone is insufficient. Incus NAT networks may require additional routing.
+
+Use `count: 1` for DHCP, or replace `count` with `addresses` (one IPv4
+CIDR per machine) and the pool's `gateway`, `nameservers` and
+`searchDomains` (shown in the example). The VM is named
+`<cluster>-<pool>-001`, which is also its hostname and Kubernetes node name. Static networking is configured inside the guest using cloud-init;
+it does not reserve addresses in an external DHCP server. Only use addresses
+allocated to you. NIC discovery uses its MAC rather than assuming the guest
+calls it `eth0`.
+
+A pool's `cloudInit` is native cloud-config, such as packages, files, and
+commands. quick8s supplies the guest hostname, SSH account, public key
+(`cluster.ssh.publicKey`; else `cluster.ssh.key`'s `.pub`; else the one
+plain key in your SSH agent), and
+required packages. Identity/network keys that conflict with those
+settings are rejected; custom user lists and external cloud-config files
+are not yet supported. Cloud-init completes before K3s installation starts.
+The public key only controls what is authorized inside the VM; logging in
+works as for any host. The agent default skips certificates, and keys the
+agent also holds a certificate for (as Teleport loads them), and refuses,
+naming the candidates, if that leaves no key or several. It's resolved on
+every `up`, and is part of the VM's checked configuration, so for a
+long-lived cluster set `publicKey` or `key` rather than depend on what
+your agent holds that day. The provider MVP supports TLS certificates
+and local Unix sockets; OIDC integration is deferred.
+
+Managed VM identity is stored next to the definition in
+`.quick8s/<definition-filename>.state.json`, with matching ownership metadata
+on the VM. Keep this directory: it is needed to resume provisioning and to
+authorize deletion. Commands lock the inventory to prevent concurrent runs
+against the same definition. A lost inventory, ownership mismatch, or changed
+provider endpoint fails safely. Copying a definition without its inventory
+does not adopt existing VMs.
+
+Repeated `up` reuses the VM, waits for cloud-init, and applies the existing
+K3s version/config reconciliation. Failed operations retain the VM and state
+for inspection and retry. A missing previously provisioned VM is an error;
+quick8s does not silently replace it with an empty cluster. DHCP address
+changes are also refused once an address is recorded, because K3s pins its
+node address. Prefer static addressing for persistent clusters.
+
+`down` confirms deletion of the owned VM, its root disk, and all cluster data
+(`--yes` skips confirmation). It does not require working guest SSH, and it
+leaves shared networks, profiles, projects, and storage pools alone. Repeating
+an interrupted deletion is safe while the inventory is present. After a
+successful `down`, the inventory is removed and a subsequent `down` reports
+that no managed inventory exists.
+
+The MVP accepts exactly one managed control-plane pool with one VM, and no
+other pools. It rejects hardware/image/cloud-init
+changes, and changes to managed network configuration. To recreate, run
+`down` before editing those settings, then run `up`. K3s configuration and
+supported version changes continue to update in place. `plan` currently
+reports infrastructure existence; it does not probe guest K3s state or
+produce a complete Kubernetes change plan. Multi-node groups, replacement,
+scaling, drain workflows, and separate SSH/node/API addresses are future work.
+
+Pools of existing `hosts` don't create an infrastructure inventory.
+
+quick8s authenticates through your running SSH agent by default — no key
+path needed, as long as the right key is loaded (`ssh-add -l` to check,
+`ssh-add ~/.ssh/id_ed25519` to load one). The agent is optional:
+`--ssh-key <path>` (or `cluster.ssh.key`) offers a private key file after
+the agent's keys, or on its own when no agent is running. A
+passphrase-protected key is only unlocked if a host accepts it, with one
+prompt per run. With neither an agent nor a key, or no key accepted,
+quick8s fails straight away with a hint. `--ssh-user` defaults to your
 local OS username (same as `ssh` itself), not root — pass it explicitly
 if the remote account differs:
 
@@ -122,9 +240,7 @@ go run ./cmd/quick8s bootstrap <host-or-ip> \
   --k3s-version v1.30.4+k3s1
 ```
 
-`--ssh-key <path>` is only needed as a fallback, e.g. against a host whose
-key isn't in your agent; if that key is passphrase-protected, quick8s
-prompts for it interactively. If `--k3s-version` is omitted, K3s installs
+If `--k3s-version` is omitted, K3s installs
 its latest stable release.
 
 ### K3s configuration file
@@ -178,7 +294,7 @@ expands to three *space-separated* words before quick8s ever sees them
 after the control plane is up, using the cluster's node token fetched
 straight from the initiating control plane over SSH — no need to pass it
 around yourself. Workers are reached with the same
-`--ssh-user`/`--ssh-port`/`--ssh-key` as the control plane, and install the
+`--ssh-user`/`--ssh-port` as the control plane, and install the
 same K3s version.
 
 ### HA control plane

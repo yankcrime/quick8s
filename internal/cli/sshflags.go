@@ -25,7 +25,7 @@ func registerSSHFlags(cmd *cobra.Command) *sshFlags {
 	f := &sshFlags{}
 	cmd.Flags().StringVar(&f.user, "ssh-user", defaultSSHUser(), "SSH user for connecting to the target node")
 	cmd.Flags().IntVar(&f.port, "ssh-port", 22, "SSH port for connecting to the target node")
-	cmd.Flags().StringVar(&f.keyPath, "ssh-key", "", "path to SSH private key (defaults to the SSH agent if unset)")
+	cmd.Flags().StringVar(&f.keyPath, "ssh-key", "", "path to an SSH private key, offered after the SSH agent's keys (optional)")
 	return f
 }
 

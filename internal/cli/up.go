@@ -1,13 +1,16 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"quick8s/internal/cluster"
 	"quick8s/internal/k3s"
+	"quick8s/internal/lifecycle"
 	"quick8s/internal/node"
 )
 
@@ -24,8 +27,9 @@ func newUpCmd() *cobra.Command {
 			"their K3s config replaced when the k3s section for their role has changed,\n" +
 			"one node at a time, control planes first. Nodes that already match are left\n" +
 			"untouched, so up is safe to re-run.\n\n" +
-			"Every node is checked over SSH, and every upgrade validated, before anything\n" +
-			"changes. Changes to running nodes restart K3s on them, so up asks first\n" +
+			"Existing hosts are checked over SSH before changes. Provider-backed clusters\n" +
+			"first provision a VM and wait for guest initialization, then reconcile K3s.\n" +
+			"Changes to running nodes restart K3s on them, so up asks first\n" +
 			"(skip with --yes). The kubeconfig is printed to stdout, e.g.\n" +
 			"`quick8s up > kubeconfig.yaml`.",
 		Args: cobra.NoArgs,
@@ -42,6 +46,22 @@ func newUpCmd() *cobra.Command {
 			return err
 		}
 		ssh := specSSH(spec.SSH)
+		var managedClient *node.Client
+		var managedSession *lifecycle.Session
+		if spec.Managed != nil {
+			session, err := lifecycle.Open(*file, spec, func(message string) { cmd.PrintErrln(message) })
+			if err != nil {
+				return err
+			}
+			defer session.Close()
+			managedSession = session
+			host, client, err := provision(cmd, session, ssh)
+			if err != nil {
+				return err
+			}
+			managedClient = client
+			spec.ControlPlanes[0].Host = host
+		}
 
 		// Connect to and inspect every node before changing any of them, so
 		// an unreachable node, a role mismatch, or an unsupported upgrade
@@ -56,7 +76,10 @@ func newUpCmd() *cobra.Command {
 		}()
 		states := map[string]cluster.NodeState{}
 		for _, n := range spec.Nodes() {
-			client, err := node.Dial(ssh.target(n.Host))
+			client := managedClient
+			if client == nil {
+				client, err = node.Dial(ssh.target(n.Host))
+			}
 			if err != nil {
 				return fmt.Errorf("connecting to %s: %w", n.Host, err)
 			}
@@ -64,6 +87,12 @@ func newUpCmd() *cobra.Command {
 			state, err := probe(client)
 			if err != nil {
 				return fmt.Errorf("%s: %w", n.Host, err)
+			}
+			if managedSession != nil && managedSession.NeedsBootstrap() && state.Installation == k3s.InstalledServer {
+				// Retry the installer even when an interrupted first run left
+				// a matching binary but no working service. applyUpdate persists
+				// its pending marker after confirmation, as for other updates.
+				state.Pending = &k3s.PendingUpdate{Version: state.Version}
 			}
 			states[n.Host] = state
 			if state.Version != "" {
@@ -95,10 +124,16 @@ func newUpCmd() *cobra.Command {
 		}
 		server := clients[plan.Server]
 
+		config := func(host string) []byte {
+			n, _ := spec.Node(host)
+			return n.Config
+		}
 		if plan.InitServer {
-			if err := initControlPlane(cmd, server, plan.Server, spec.ServerConfig, k3s.InstallOpts{
-				Version:     spec.KubernetesVersion,
-				ClusterInit: len(spec.ControlPlanes) > 1,
+			if err := initControlPlane(cmd, server, plan.Server, config(plan.Server), k3s.InstallOpts{
+				Version: spec.KubernetesVersion,
+				// A managed pool grows by changing a number, so it starts on
+				// embedded etcd rather than refusing to grow later.
+				ClusterInit: len(spec.ControlPlanes) > 1 || spec.Managed != nil,
 			}); err != nil {
 				return err
 			}
@@ -120,7 +155,7 @@ func newUpCmd() *cobra.Command {
 		}
 
 		for _, u := range plan.Update {
-			if err := applyUpdate(cmd, clients[u.Host], u, spec.Config(u.ControlPlane), r.options(u.Host, u.ControlPlane, u.To)); err != nil {
+			if err := applyUpdate(cmd, clients[u.Host], u, config(u.Host), r.options(u.Host, u.ControlPlane, u.To)); err != nil {
 				return err
 			}
 		}
@@ -133,8 +168,13 @@ func newUpCmd() *cobra.Command {
 		if err != nil {
 			return fmt.Errorf("control plane %s: %w", plan.Server, err)
 		}
+		if spec.Managed != nil {
+			if err := k3s.WaitReady(cmd.Context(), server, k3s.InstalledServer, running, indented(cmd)); err != nil {
+				return err
+			}
+		}
 		for _, host := range plan.JoinControlPlanes {
-			if err := addControlPlane(cmd, clients[host], host, spec.ServerConfig, k3s.ControlPlaneOpts{
+			if err := addControlPlane(cmd, clients[host], host, config(host), k3s.ControlPlaneOpts{
 				Version:   running,
 				ServerURL: r.serverURL(),
 				Token:     r.token,
@@ -143,7 +183,7 @@ func newUpCmd() *cobra.Command {
 			}
 		}
 		for _, host := range plan.JoinWorkers {
-			if err := addWorker(cmd, clients[host], host, spec.AgentConfig, k3s.AgentOpts{
+			if err := addWorker(cmd, clients[host], host, config(host), k3s.AgentOpts{
 				Version:   running,
 				ServerURL: r.serverURL(),
 				Token:     r.token,
@@ -152,7 +192,12 @@ func newUpCmd() *cobra.Command {
 			}
 		}
 
-		if plan.Empty() {
+		relabeled, err := applyNodeMetadata(cmd, server, clients, spec.Nodes())
+		if err != nil {
+			return err
+		}
+
+		if plan.Empty() && !relabeled {
 			cmd.PrintErrln("All nodes already match the cluster definition; nothing to do.")
 		} else {
 			cmd.PrintErrf("Cluster is up, running K3s %s.\n", running)
@@ -162,11 +207,34 @@ func newUpCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
+		if spec.Managed != nil {
+			cmd.PrintErrln("Checking Kubernetes API access from this runner...")
+			if err := k3s.CheckAccess(cmd.Context(), kubeconfig); err != nil {
+				return err
+			}
+			if err := managedSession.MarkReady(); err != nil {
+				return err
+			}
+		}
 		_, err = fmt.Fprintln(cmd.OutOrStdout(), kubeconfig)
 		return err
 	}
 
 	return cmd
+}
+
+// provision creates or reuses the managed VM and connects to it once its
+// guest is initialized. The deadline covers only this wait: the connection
+// it returns outlives it, for the K3s rollout that follows.
+func provision(cmd *cobra.Command, session *lifecycle.Session, ssh *sshFlags) (string, *node.Client, error) {
+	ctx, cancel := context.WithTimeout(cmd.Context(), 15*time.Minute)
+	defer cancel()
+	host, err := session.Ensure(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	client, err := lifecycle.WaitGuest(ctx, ssh.target(host), func(message string) { cmd.PrintErrln(message) })
+	return host, client, err
 }
 
 // probe finds out what K3s, if any, an already-connected node runs.
@@ -186,14 +254,37 @@ func probe(client *node.Client) (cluster.NodeState, error) {
 	return s, err
 }
 
+// applyNodeMetadata converges the labels and taints of nodes whose pools
+// declare them, through the API, once all nodes have joined. Other nodes
+// are left alone, with no API calls. Unlike K3s config changes, this needs
+// no restart, so it isn't part of the confirmed plan.
+func applyNodeMetadata(cmd *cobra.Command, server *node.Client, clients map[string]*node.Client, nodes []cluster.Node) (bool, error) {
+	changed := false
+	for _, n := range nodes {
+		if n.Metadata == nil {
+			continue
+		}
+		name, updated, err := k3s.ApplyNodeMetadata(cmd.Context(), clients[n.Host], server, *n.Metadata)
+		if err != nil {
+			return changed, fmt.Errorf("%s: %w", n.Host, err)
+		}
+		if updated {
+			cmd.PrintErrf("Updated labels and taints on %s (node %s).\n", n.Host, name)
+			changed = true
+		}
+	}
+	return changed, nil
+}
+
 // describeUpdate summarizes an in-place change for confirmation.
 func describeUpdate(spec *cluster.Spec, u cluster.Update) string {
+	n, _ := spec.Node(u.Host)
 	var changes []string
 	if u.Upgrade() {
 		changes = append(changes, fmt.Sprintf("upgrade K3s %s -> %s", u.From, u.To))
 	}
 	switch {
-	case u.Config && spec.Config(u.ControlPlane) == nil:
+	case u.Config && n.Config == nil:
 		changes = append(changes, "remove K3s config")
 	case u.Config:
 		changes = append(changes, "update K3s config")

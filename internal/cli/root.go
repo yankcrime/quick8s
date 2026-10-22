@@ -10,11 +10,12 @@ import (
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "quick8s",
-		Short:         "Bootstrap K3s Kubernetes clusters over SSH",
+		Short:         "Bootstrap K3s on existing hosts or managed Incus VMs",
 		SilenceErrors: true, // main owns error reporting.
 	}
 
 	root.AddCommand(newUpCmd())
+	root.AddCommand(newPlanCmd())
 	root.AddCommand(newDownCmd())
 	root.AddCommand(newBootstrapCmd())
 	root.AddCommand(newJoinCmd())

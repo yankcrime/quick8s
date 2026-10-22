@@ -1,15 +1,18 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"quick8s/internal/cluster"
 	"quick8s/internal/k3s"
+	"quick8s/internal/lifecycle"
 	"quick8s/internal/node"
 )
 
@@ -18,11 +21,13 @@ func newDownCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "down",
-		Short: "Uninstall K3s from every node defined in quick8s.yaml",
+		Short: "Remove the cluster, deleting its managed VMs or uninstalling K3s on existing hosts",
 		Long: "Read the cluster definition (quick8s.yaml in the current directory, or --file)\n" +
 			"and run K3s's own uninstall script on every node in it, workers first. This\n" +
 			"destroys the cluster and its data and cannot be undone. Nodes without K3s\n" +
-			"are skipped, and a node that fails doesn't stop the others from being removed.",
+			"are skipped, and a node that fails doesn't stop the others from being removed.\n" +
+			"For provider-backed clusters, delete the owned VM and its root disk instead;\n" +
+			"shared provider networks, projects and storage pools are retained.",
 		Args: cobra.NoArgs,
 	}
 
@@ -35,6 +40,26 @@ func newDownCmd() *cobra.Command {
 		spec, err := cluster.Load(*file)
 		if err != nil {
 			return err
+		}
+		if spec.Managed != nil {
+			session, err := lifecycle.Open(*file, spec, func(message string) { cmd.PrintErrln(message) })
+			if err != nil {
+				return err
+			}
+			defer session.Close()
+			if !yes {
+				ok, err := confirm(cmd, fmt.Sprintf("Delete Incus VM %s, its root disk, and all cluster data?", session.MachineName()))
+				if err != nil {
+					return err
+				}
+				if !ok {
+					cmd.PrintErrln("Aborted.")
+					return nil
+				}
+			}
+			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Minute)
+			defer cancel()
+			return session.Destroy(ctx)
 		}
 		ssh := specSSH(spec.SSH)
 
